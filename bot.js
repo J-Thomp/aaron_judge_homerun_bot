@@ -1,6 +1,7 @@
 const Discord = require('discord.js');
 const axios = require('axios');
 const cron = require('node-cron');
+require('dotenv').config();
 
 class AaronJudgeBot {
     constructor(token, channelId) {
@@ -24,6 +25,11 @@ class AaronJudgeBot {
         this.client.on('ready', () => {
             console.log(`Bot logged in as ${this.client.user.tag}`);
             this.startMonitoring();
+        });
+
+        // Add error handling
+        this.client.on('error', (error) => {
+            console.error('Discord client error:', error);
         });
 
         // Add message listener here
@@ -129,10 +135,22 @@ class AaronJudgeBot {
 }
 
 // Usage
-const bot = new AaronJudgeBot(
-    process.env.BOT_TOKEN,
-    process.env.CHANNEL_ID
-);
+const botToken = process.env.BOT_TOKEN;
+const channelId = process.env.CHANNEL_ID;
+
+if (!botToken || !channelId) {
+    console.error('Missing required environment variables: BOT_TOKEN and/or CHANNEL_ID');
+    process.exit(1);
+}
+
+const bot = new AaronJudgeBot(botToken, channelId);
+
+// Keep the process alive (required for Render)
+process.on('SIGTERM', () => {
+    console.log('Received SIGTERM, shutting down gracefully');
+    bot.client.destroy();
+    process.exit(0);
+});
 
 // Start the bot
 bot.initialize().catch(console.error);
