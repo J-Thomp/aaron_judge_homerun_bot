@@ -1,7 +1,6 @@
 const Discord = require('discord.js');
 const axios = require('axios');
 const cron = require('node-cron');
-require('dotenv').config();
 
 class AaronJudgeBot {
     constructor(token, channelId) {
@@ -145,7 +144,7 @@ if (!botToken || !channelId) {
 
 const bot = new AaronJudgeBot(botToken, channelId);
 
-// Keep the process alive (required for Render)
+// Keep the process alive
 process.on('SIGTERM', () => {
     console.log('Received SIGTERM, shutting down gracefully');
     bot.client.destroy();
