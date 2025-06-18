@@ -1,0 +1,39 @@
+{
+  "name": "aaron-judge-discord-bot",
+  "version": "1.0.0",
+  "description": "Discord bot that alerts when Aaron Judge hits home runs",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "nodemon bot.js"
+  },
+  "engines": {
+    "node": "18.x"
+  },
+  "dependencies": {
+    "axios": "^1.10.0",
+    "discord.js": "^14.20.0",
+    "node-cron": "^3.0.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "baseball",
+    "aaron-judge",
+    "mlb"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/J-Thomp/aaron_judge_homerun_bot.git"
+  },
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/J-Thomp/aaron_judge_homerun_bot/issues"
+  },
+  "homepage": "https://github.com/J-Thomp/aaron_judge_homerun_bot#readme"
+}
