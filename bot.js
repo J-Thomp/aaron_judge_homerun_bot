@@ -16,14 +16,14 @@ class BaseballBot {
         this.channelId = channelId;
         this.currentSeason = new Date().getFullYear();
         
-        // Players to monitor - Your requested lineup
+        // Players to monitor - Your requested lineup  
         this.players = {
             '592450': { name: 'Aaron Judge', team: 'NYY', number: '99', lastCheckedHR: 0 },
             '665862': { name: 'Jazz Chisholm Jr.', team: 'NYY', number: '13', lastCheckedHR: 0 },
             '665742': { name: 'Juan Soto', team: 'NYM', number: '22', lastCheckedHR: 0 },
             '660271': { name: 'Shohei Ohtani', team: 'LAD', number: '17', lastCheckedHR: 0 },
             '656941': { name: 'Kyle Schwarber', team: 'PHI', number: '12', lastCheckedHR: 0 },
-            '608070': { name: 'Ronald Acuña Jr.', team: 'ATL', number: '13', lastCheckedHR: 0 }
+            '660670': { name: 'Ronald Acuña Jr.', team: 'ATL', number: '13', lastCheckedHR: 0 }
         };
     }
 
@@ -125,7 +125,7 @@ class BaseballBot {
                 'Juan Soto': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/665742/headshot/67/current',
                 'Shohei Ohtani': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660271/headshot/67/current',
                 'Kyle Schwarber': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/656941/headshot/67/current',
-                'Ronald Acuña Jr.': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/608070/headshot/67/current'
+                'Ronald Acuña Jr.': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660670/headshot/67/current'
             };
             
             if (headshots[playerData.name]) {
@@ -180,7 +180,7 @@ class BaseballBot {
         }
         
         if (content === '!acuna') {
-            await this.sendPlayerStats('608070', message);
+            await this.sendPlayerStats('660670', message);
         }
         
         // List all tracked players
@@ -207,18 +207,9 @@ class BaseballBot {
             const embed = new Discord.EmbedBuilder()
                 .setTitle(`${playerData.name} ${this.currentSeason} Stats`)
                 .addFields(
-                    { name: 'Batting Average', value: stats.avg || 'N/A', inline: true },
-                    { name: 'Home Runs', value: `${stats.homeRuns || 0}`, inline: true },
-                    { name: 'RBIs', value: `${stats.rbi || 0}`, inline: true },
-                    { name: 'Runs', value: `${stats.runs || 0}`, inline: true },
-                    { name: 'Hits', value: `${stats.hits || 0}`, inline: true },
-                    { name: 'At Bats', value: `${stats.atBats || 0}`, inline: true },
-                    { name: 'OBP', value: stats.obp || 'N/A', inline: true },
-                    { name: 'SLG', value: stats.slg || 'N/A', inline: true },
-                    { name: 'OPS', value: stats.ops || 'N/A', inline: true },
-                    { name: 'Stolen Bases', value: `${stats.stolenBases || 0}`, inline: true },
-                    { name: 'Strikeouts', value: `${stats.strikeOuts || 0}`, inline: true },
-                    { name: 'Walks', value: `${stats.baseOnBalls || 0}`, inline: true }
+                    { name: '⚾ Hitting', value: `**AVG:** ${stats.avg || 'N/A'} | **HR:** ${stats.homeRuns || 0} | **RBI:** ${stats.rbi || 0} | **R:** ${stats.runs || 0}`, inline: false },
+                    { name: '📊 Advanced', value: `**OBP:** ${stats.obp || 'N/A'} | **SLG:** ${stats.slg || 'N/A'} | **OPS:** ${stats.ops || 'N/A'}`, inline: false },
+                    { name: '🏃 Other', value: `**H:** ${stats.hits || 0} | **AB:** ${stats.atBats || 0} | **SB:** ${stats.stolenBases || 0} | **SO:** ${stats.strikeOuts || 0} | **BB:** ${stats.baseOnBalls || 0}`, inline: false }
                 )
                 .setColor('#132448')
                 .setTimestamp()
