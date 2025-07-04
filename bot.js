@@ -289,7 +289,7 @@ class BaseballBot {
 
 // Usage
 const botToken = process.env.BOT_TOKEN;
-const channelId = process.env.CHANNEL_ID;
+const channelIds = process.env.CHANNEL_IDS.split(',');
 
 if (!botToken || !channelId) {
     console.error('Missing required environment variables: BOT_TOKEN and/or CHANNEL_ID');
