@@ -16,14 +16,16 @@ class BaseballBot {
         this.channelId = channelId;
         this.currentSeason = new Date().getFullYear();
         
-        // Players to monitor - Your requested lineup  
+        // Players to monitor - Updated with Pete Alonso and Bryce Harper
         this.players = {
             '592450': { name: 'Aaron Judge', team: 'NYY', number: '99', lastCheckedHR: 0 },
             '665862': { name: 'Jazz Chisholm Jr.', team: 'NYY', number: '13', lastCheckedHR: 0 },
             '665742': { name: 'Juan Soto', team: 'NYM', number: '22', lastCheckedHR: 0 },
             '660271': { name: 'Shohei Ohtani', team: 'LAD', number: '17', lastCheckedHR: 0 },
             '656941': { name: 'Kyle Schwarber', team: 'PHI', number: '12', lastCheckedHR: 0 },
-            '660670': { name: 'Ronald Acuña Jr.', team: 'ATL', number: '13', lastCheckedHR: 0 }
+            '660670': { name: 'Ronald Acuña Jr.', team: 'ATL', number: '13', lastCheckedHR: 0 },
+            '624413': { name: 'Pete Alonso', team: 'NYM', number: '20', lastCheckedHR: 0 },
+            '547180': { name: 'Bryce Harper', team: 'PHI', number: '3', lastCheckedHR: 0 }
         };
     }
 
@@ -72,20 +74,72 @@ class BaseballBot {
         return stats ? parseInt(stats.homeRuns) || 0 : 0;
     }
 
-    async getRecentHomeRunDistance(playerId) {
+    async getRecentHomeRunDetails(playerId) {
         try {
-            // Get player's recent games to find home run details
+            // Get player's recent games
             const gamesResponse = await axios.get(
-                `https://statsapi.mlb.com/api/v1/people/${playerId}/gameLog?season=${this.currentSeason}&gameType=R&limit=10`
+                `https://statsapi.mlb.com/api/v1/people/${playerId}/gameLog?season=${this.currentSeason}&gameType=R&limit=5`
             );
             
-            // This is a simplified approach - in reality, getting home run distance
-            // requires detailed play-by-play data which is more complex
-            // For now, we'll return a placeholder
-            return "Distance data not available";
+            if (!gamesResponse.data.dates || gamesResponse.data.dates.length === 0) {
+                return { distance: "Distance not available", rbi: "RBI not available" };
+            }
+
+            // Look through recent games for home runs
+            for (const date of gamesResponse.data.dates) {
+                for (const game of date.games) {
+                    try {
+                        // Get detailed game data
+                        const gameDetailResponse = await axios.get(
+                            `https://statsapi.mlb.com/api/v1/game/${game.gameId}/feed/live`
+                        );
+                        
+                        const gameData = gameDetailResponse.data;
+                        if (!gameData.liveData || !gameData.liveData.plays || !gameData.liveData.plays.allPlays) {
+                            continue;
+                        }
+
+                        // Look for home runs by this player
+                        const plays = gameData.liveData.plays.allPlays;
+                        for (const play of plays.reverse()) { // Start with most recent plays
+                            if (play.result && play.result.type === 'atBat' && 
+                                play.result.event === 'Home Run' && 
+                                play.matchup && play.matchup.batter && 
+                                play.matchup.batter.id.toString() === playerId) {
+                                
+                                let distance = "Distance not available";
+                                let rbi = play.result.rbi || 0;
+                                
+                                // Try to get distance from hit data
+                                if (play.hitData && play.hitData.totalDistance) {
+                                    distance = `${play.hitData.totalDistance} ft`;
+                                }
+                                
+                                // Determine RBI description
+                                let rbiDescription = "Solo HR";
+                                if (rbi === 2) rbiDescription = "2-run HR";
+                                else if (rbi === 3) rbiDescription = "3-run HR";
+                                else if (rbi === 4) rbiDescription = "Grand Slam!";
+                                
+                                return { 
+                                    distance: distance, 
+                                    rbi: rbi,
+                                    rbiDescription: rbiDescription,
+                                    gameId: game.gameId
+                                };
+                            }
+                        }
+                    } catch (gameError) {
+                        console.error(`Error fetching game ${game.gameId} details:`, gameError.message);
+                        continue;
+                    }
+                }
+            }
+            
+            return { distance: "Distance not available", rbi: "RBI not available" };
         } catch (error) {
-            console.error('Error fetching home run distance:', error.message);
-            return "Distance data not available";
+            console.error('Error fetching home run details:', error.message);
+            return { distance: "Distance not available", rbi: "RBI not available" };
         }
     }
 
@@ -95,14 +149,14 @@ class BaseballBot {
             
             if (currentHomeRuns > playerData.lastCheckedHR) {
                 const newHomeRuns = currentHomeRuns - playerData.lastCheckedHR;
-                const distance = await this.getRecentHomeRunDistance(playerId);
-                await this.sendHomeRunAlert(playerData, currentHomeRuns, newHomeRuns, distance);
+                const homeRunDetails = await this.getRecentHomeRunDetails(playerId);
+                await this.sendHomeRunAlert(playerData, currentHomeRuns, newHomeRuns, homeRunDetails);
                 this.players[playerId].lastCheckedHR = currentHomeRuns;
             }
         }
     }
 
-    async sendHomeRunAlert(playerData, totalHomeRuns, newCount, distance) {
+    async sendHomeRunAlert(playerData, totalHomeRuns, newCount, details) {
         try {
             const channel = await this.client.channels.fetch(this.channelId);
             
@@ -113,7 +167,9 @@ class BaseballBot {
                     { name: 'Player', value: `${playerData.name} (#${playerData.number})`, inline: true },
                     { name: 'Team', value: playerData.team, inline: true },
                     { name: 'Season Total', value: `${totalHomeRuns} HR`, inline: true },
-                    { name: 'Distance', value: distance, inline: false }
+                    { name: 'Distance', value: details.distance, inline: true },
+                    { name: 'Type', value: details.rbiDescription || 'Solo HR', inline: true },
+                    { name: 'RBI', value: details.rbi ? `${details.rbi} RBI` : 'N/A', inline: true }
                 )
                 .setColor('#132448')
                 .setTimestamp();
@@ -125,7 +181,9 @@ class BaseballBot {
                 'Juan Soto': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/665742/headshot/67/current',
                 'Shohei Ohtani': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660271/headshot/67/current',
                 'Kyle Schwarber': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/656941/headshot/67/current',
-                'Ronald Acuña Jr.': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660670/headshot/67/current'
+                'Ronald Acuña Jr.': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660670/headshot/67/current',
+                'Pete Alonso': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/624413/headshot/67/current',
+                'Bryce Harper': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/547180/headshot/67/current'
             };
             
             if (headshots[playerData.name]) {
@@ -133,7 +191,7 @@ class BaseballBot {
             }
 
             await channel.send({ embeds: [embed] });
-            console.log(`Sent home run alert for ${playerData.name}! Total: ${totalHomeRuns}`);
+            console.log(`Sent home run alert for ${playerData.name}! Total: ${totalHomeRuns}, Distance: ${details.distance}, RBI: ${details.rbi}`);
         } catch (error) {
             console.error('Error sending message:', error.message);
         }
@@ -157,12 +215,11 @@ class BaseballBot {
     async handleCommand(message) {
         const content = message.content.toLowerCase();
         
-        // Enhanced !judge command with full stats
+        // Enhanced commands for all players
         if (content === '!judge') {
             await this.sendPlayerStats('592450', message);
         }
         
-        // Add commands for other players
         if (content === '!jazz') {
             await this.sendPlayerStats('665862', message);
         }
@@ -183,6 +240,15 @@ class BaseballBot {
             await this.sendPlayerStats('660670', message);
         }
         
+        // New commands for Pete Alonso and Bryce Harper
+        if (content === '!alonso') {
+            await this.sendPlayerStats('624413', message);
+        }
+        
+        if (content === '!harper') {
+            await this.sendPlayerStats('547180', message);
+        }
+        
         // List all tracked players
         if (content === '!players') {
             await this.sendTrackedPlayers(message);
@@ -191,6 +257,11 @@ class BaseballBot {
         // Show all players' home run totals
         if (content === '!hrstats') {
             await this.sendAllHomeRunStats(message);
+        }
+        
+        // Test home run alert command
+        if (content === '!testhr') {
+            await this.sendTestHomeRunAlert(message);
         }
     }
 
@@ -222,7 +293,9 @@ class BaseballBot {
                 'Juan Soto': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/665742/headshot/67/current',
                 'Shohei Ohtani': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660271/headshot/67/current',
                 'Kyle Schwarber': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/656941/headshot/67/current',
-                'Ronald Acuña Jr.': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/608070/headshot/67/current'
+                'Ronald Acuña Jr.': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660670/headshot/67/current',
+                'Pete Alonso': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/624413/headshot/67/current',
+                'Bryce Harper': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/547180/headshot/67/current'
             };
             
             if (headshots[playerData.name]) {
@@ -245,7 +318,7 @@ class BaseballBot {
             .setTitle('📊 Tracked Players')
             .setDescription(`Currently monitoring these players for home runs:\n\n${playerList}`)
             .addFields(
-                { name: 'Available Commands', value: '!judge, !jazz, !soto, !ohtani, !schwarber, !acuna, !hrstats', inline: false }
+                { name: 'Available Commands', value: '!judge, !jazz, !soto, !ohtani, !schwarber, !acuna, !alonso, !harper, !hrstats, !testhr', inline: false }
             )
             .setColor('#132448')
             .setTimestamp();
@@ -285,11 +358,74 @@ class BaseballBot {
             await message.reply('Sorry, I had trouble getting the home run stats!');
         }
     }
+
+    async sendTestHomeRunAlert(message) {
+        try {
+            // Pick a random player for the test
+            const playerIds = Object.keys(this.players);
+            const randomPlayerId = playerIds[Math.floor(Math.random() * playerIds.length)];
+            const playerData = this.players[randomPlayerId];
+            
+            // Create sample home run data
+            const sampleDistances = ['415 ft', '438 ft', '462 ft', '395 ft', '441 ft', '478 ft'];
+            const sampleRBIs = [1, 2, 3, 4];
+            const sampleHRTypes = ['Solo HR', '2-run HR', '3-run HR', 'Grand Slam!'];
+            
+            const randomDistance = sampleDistances[Math.floor(Math.random() * sampleDistances.length)];
+            const randomRBI = sampleRBIs[Math.floor(Math.random() * sampleRBIs.length)];
+            const randomHRType = sampleHRTypes[randomRBI - 1];
+            
+            const testDetails = {
+                distance: randomDistance,
+                rbi: randomRBI,
+                rbiDescription: randomHRType
+            };
+            
+            const channel = message.channel;
+            
+            const embed = new Discord.EmbedBuilder()
+                .setTitle(`⚾ ${playerData.name.toUpperCase()} HOME RUN! ⚾`)
+                .setDescription(`${playerData.name} just hit a home run! (This is a test alert)`)
+                .addFields(
+                    { name: 'Player', value: `${playerData.name} (#${playerData.number})`, inline: true },
+                    { name: 'Team', value: playerData.team, inline: true },
+                    { name: 'Season Total', value: `${Math.floor(Math.random() * 40) + 10} HR`, inline: true },
+                    { name: 'Distance', value: testDetails.distance, inline: true },
+                    { name: 'Type', value: testDetails.rbiDescription, inline: true },
+                    { name: 'RBI', value: `${testDetails.rbi} RBI`, inline: true }
+                )
+                .setColor('#132448')
+                .setTimestamp()
+                .setFooter({ text: '🧪 This is a test alert to show you what home run notifications will look like!' });
+
+            // Set player headshot
+            const headshots = {
+                'Aaron Judge': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/592450/headshot/67/current',
+                'Jazz Chisholm Jr.': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/665862/headshot/67/current',
+                'Juan Soto': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/665742/headshot/67/current',
+                'Shohei Ohtani': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660271/headshot/67/current',
+                'Kyle Schwarber': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/656941/headshot/67/current',
+                'Ronald Acuña Jr.': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660670/headshot/67/current',
+                'Pete Alonso': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/624413/headshot/67/current',
+                'Bryce Harper': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/547180/headshot/67/current'
+            };
+            
+            if (headshots[playerData.name]) {
+                embed.setThumbnail(headshots[playerData.name]);
+            }
+
+            await channel.send({ embeds: [embed] });
+            console.log(`Sent test home run alert for ${playerData.name}!`);
+        } catch (error) {
+            console.error('Error sending test message:', error.message);
+            await message.reply('Sorry, I had trouble sending the test alert!');
+        }
+    }
 }
 
 // Usage
 const botToken = process.env.BOT_TOKEN;
-const channelIds = process.env.CHANNEL_ID.split(',');
+const channelId = process.env.CHANNEL_ID;
 
 if (!botToken || !channelId) {
     console.error('Missing required environment variables: BOT_TOKEN and/or CHANNEL_ID');
