@@ -160,16 +160,20 @@ class BaseballBot {
         try {
             const channel = await this.client.channels.fetch(this.channelId);
             
+            // Create dynamic title based on HR type
+            const hrType = details.rbiDescription || 'Solo HR';
+            const titleText = hrType === 'Grand Slam!' ? 
+                `⚾ ${playerData.name.toUpperCase()} GRAND SLAM! ⚾` :
+                `⚾ ${playerData.name.toUpperCase()} ${hrType.toUpperCase().replace(' HR', ' HOME RUN')}! ⚾`;
+            
             const embed = new Discord.EmbedBuilder()
-                .setTitle(`⚾ ${playerData.name.toUpperCase()} HOME RUN! ⚾`)
+                .setTitle(titleText)
                 .setDescription(`${playerData.name} just hit ${newCount > 1 ? `${newCount} home runs` : 'a home run'}!`)
                 .addFields(
                     { name: 'Player', value: `${playerData.name} (#${playerData.number})`, inline: true },
                     { name: 'Team', value: playerData.team, inline: true },
                     { name: 'Season Total', value: `${totalHomeRuns} HR`, inline: true },
-                    { name: 'Distance', value: details.distance, inline: true },
-                    { name: 'Type', value: details.rbiDescription || 'Solo HR', inline: true },
-                    { name: 'RBI', value: details.rbi ? `${details.rbi} RBI` : 'N/A', inline: true }
+                    { name: 'Distance', value: details.distance, inline: true }
                 )
                 .setColor('#132448')
                 .setTimestamp();
@@ -383,16 +387,20 @@ class BaseballBot {
             
             const channel = message.channel;
             
+            // Create dynamic title based on HR type
+            const hrType = testDetails.rbiDescription;
+            const titleText = hrType === 'Grand Slam!' ? 
+                `⚾ ${playerData.name.toUpperCase()} GRAND SLAM! ⚾` :
+                `⚾ ${playerData.name.toUpperCase()} ${hrType.toUpperCase().replace(' HR', ' HOME RUN')}! ⚾`;
+            
             const embed = new Discord.EmbedBuilder()
-                .setTitle(`⚾ ${playerData.name.toUpperCase()} HOME RUN! ⚾`)
+                .setTitle(titleText)
                 .setDescription(`${playerData.name} just hit a home run! (This is a test alert)`)
                 .addFields(
                     { name: 'Player', value: `${playerData.name} (#${playerData.number})`, inline: true },
                     { name: 'Team', value: playerData.team, inline: true },
                     { name: 'Season Total', value: `${Math.floor(Math.random() * 40) + 10} HR`, inline: true },
-                    { name: 'Distance', value: testDetails.distance, inline: true },
-                    { name: 'Type', value: testDetails.rbiDescription, inline: true },
-                    { name: 'RBI', value: `${testDetails.rbi} RBI`, inline: true }
+                    { name: 'Distance', value: testDetails.distance, inline: true }
                 )
                 .setColor('#132448')
                 .setTimestamp()
