@@ -4,7 +4,7 @@ const axios = require('axios');
 const cron = require('node-cron');
 
 class BaseballBot {
-    constructor(token, channelId) {
+    constructor(token, channelIds) {
         this.client = new Discord.Client({
             intents: [
                 Discord.GatewayIntentBits.Guilds,
@@ -13,7 +13,8 @@ class BaseballBot {
             ]
         });
         this.token = token;
-        this.channelId = channelId;
+        // Support multiple channel IDs
+        this.channelIds = Array.isArray(channelIds) ? channelIds : [channelIds];
         this.currentSeason = new Date().getFullYear();
         
         // Players to monitor - Updated with Pete Alonso and Bryce Harper
@@ -27,21 +28,36 @@ class BaseballBot {
             '624413': { name: 'Pete Alonso', team: 'NYM', number: '20', lastCheckedHR: 0 },
             '547180': { name: 'Bryce Harper', team: 'PHI', number: '3', lastCheckedHR: 0 }
         };
+        
+        // Add debugging flag
+        this.debugging = true;
+        this.lastCheckTime = null;
+    }
+
+    log(message) {
+        const timestamp = new Date().toISOString();
+        console.log(`[${timestamp}] ${message}`);
     }
 
     async initialize() {
+        this.log('Initializing bot...');
+        this.log(`Configured to send alerts to ${this.channelIds.length} channel(s): ${this.channelIds.join(', ')}`);
+        
         // Initialize home run counts for all players
         for (const playerId of Object.keys(this.players)) {
-            this.players[playerId].lastCheckedHR = await this.getPlayerHomeRuns(playerId);
+            const currentHR = await this.getPlayerHomeRuns(playerId);
+            this.players[playerId].lastCheckedHR = currentHR;
+            this.log(`Initialized ${this.players[playerId].name}: ${currentHR} HRs`);
         }
         
         this.client.on('ready', () => {
-            console.log(`Bot logged in as ${this.client.user.tag}`);
+            this.log(`Bot logged in as ${this.client.user.tag}`);
             this.startMonitoring();
         });
 
         this.client.on('error', (error) => {
-            console.error('Discord client error:', error);
+            this.log(`Discord client error: ${error.message}`);
+            console.error('Full error:', error);
         });
 
         this.client.on('messageCreate', async (message) => {
@@ -64,7 +80,7 @@ class BaseballBot {
             }
             return null;
         } catch (error) {
-            console.error(`Error fetching stats for player ${playerId}:`, error.message);
+            this.log(`Error fetching stats for player ${playerId}: ${error.message}`);
             return null;
         }
     }
@@ -116,7 +132,7 @@ class BaseballBot {
                                 }
                                 
                                 // Determine RBI description
-                                let rbiDescription = "Solo HR";
+                                let rbiDescription = "solo HR";
                                 if (rbi === 2) rbiDescription = "2-run HR";
                                 else if (rbi === 3) rbiDescription = "3-run HR";
                                 else if (rbi === 4) rbiDescription = "Grand Slam!";
@@ -130,7 +146,7 @@ class BaseballBot {
                             }
                         }
                     } catch (gameError) {
-                        console.error(`Error fetching game ${game.gameId} details:`, gameError.message);
+                        this.log(`Error fetching game ${game.gameId} details: ${gameError.message}`);
                         continue;
                     }
                 }
@@ -138,67 +154,93 @@ class BaseballBot {
             
             return { distance: "Distance not available", rbi: "RBI not available" };
         } catch (error) {
-            console.error('Error fetching home run details:', error.message);
+            this.log(`Error fetching home run details: ${error.message}`);
             return { distance: "Distance not available", rbi: "RBI not available" };
         }
     }
 
     async checkForNewHomeRuns() {
+        this.lastCheckTime = new Date();
+        this.log(`Starting home run check at ${this.lastCheckTime.toISOString()}`);
+        
+        let alertsSent = 0;
+        
         for (const [playerId, playerData] of Object.entries(this.players)) {
-            const currentHomeRuns = await this.getPlayerHomeRuns(playerId);
-            
-            if (currentHomeRuns > playerData.lastCheckedHR) {
-                const newHomeRuns = currentHomeRuns - playerData.lastCheckedHR;
-                const homeRunDetails = await this.getRecentHomeRunDetails(playerId);
-                await this.sendHomeRunAlert(playerData, currentHomeRuns, newHomeRuns, homeRunDetails);
-                this.players[playerId].lastCheckedHR = currentHomeRuns;
+            try {
+                const currentHomeRuns = await this.getPlayerHomeRuns(playerId);
+                
+                this.log(`${playerData.name}: Current=${currentHomeRuns}, Last=${playerData.lastCheckedHR}`);
+                
+                if (currentHomeRuns > playerData.lastCheckedHR) {
+                    const newHomeRuns = currentHomeRuns - playerData.lastCheckedHR;
+                    this.log(`🚨 NEW HOME RUN DETECTED! ${playerData.name} went from ${playerData.lastCheckedHR} to ${currentHomeRuns} (+${newHomeRuns})`);
+                    
+                    const homeRunDetails = await this.getRecentHomeRunDetails(playerId);
+                    await this.sendHomeRunAlert(playerData, currentHomeRuns, newHomeRuns, homeRunDetails);
+                    this.players[playerId].lastCheckedHR = currentHomeRuns;
+                    alertsSent++;
+                }
+            } catch (error) {
+                this.log(`Error checking ${playerData.name}: ${error.message}`);
+                console.error(`Full error for ${playerData.name}:`, error);
             }
         }
+        
+        this.log(`Home run check completed. Alerts sent: ${alertsSent}`);
     }
 
     async sendHomeRunAlert(playerData, totalHomeRuns, newCount, details) {
-        try {
-            const channel = await this.client.channels.fetch(this.channelId);
-            
-            // Create dynamic title based on HR type
-            const hrType = details.rbiDescription || 'Solo HR';
-            const titleText = hrType === 'Grand Slam!' ? 
-                `⚾ ${playerData.name.toUpperCase()} GRAND SLAM! ⚾` :
-                `⚾ ${playerData.name.toUpperCase()} ${hrType.toUpperCase().replace(' HR', ' HOME RUN')}! ⚾`;
-            
-            const embed = new Discord.EmbedBuilder()
-                .setTitle(titleText)
-                .setDescription(`${playerData.name} just hit ${newCount > 1 ? `${newCount} home runs` : 'a home run'}!`)
-                .addFields(
-                    { name: 'Player', value: `${playerData.name} (#${playerData.number})`, inline: true },
-                    { name: 'Team', value: playerData.team, inline: true },
-                    { name: 'Season Total', value: `${totalHomeRuns} HR`, inline: true },
-                    { name: 'Distance', value: details.distance, inline: true }
-                )
-                .setColor('#132448')
-                .setTimestamp();
+        this.log(`Sending home run alert for ${playerData.name} to ${this.channelIds.length} channel(s)...`);
+        
+        // Create the embed once
+        const hrType = details.rbiDescription || 'Solo HR';
+        const titleText = hrType === 'Grand Slam!' ? 
+            `⚾ ${playerData.name.toUpperCase()} GRAND SLAM! ⚾` :
+            `⚾ ${playerData.name.toUpperCase()} ${hrType.toUpperCase().replace(' HR', ' HOME RUN')}! ⚾`;
+        
+        const embed = new Discord.EmbedBuilder()
+            .setTitle(titleText)
+            .setDescription(`${playerData.name} just hit ${newCount > 1 ? `${newCount} home runs` : 'a home run'}!`)
+            .addFields(
+                { name: 'Player', value: `${playerData.name} (#${playerData.number})`, inline: true },
+                { name: 'Team', value: playerData.team, inline: true },
+                { name: 'Season Total', value: `${totalHomeRuns} HR`, inline: true },
+                { name: 'Distance', value: details.distance, inline: true }
+            )
+            .setColor('#132448')
+            .setTimestamp();
 
-            // Set player headshot using MLB's official headshot URLs
-            const headshots = {
-                'Aaron Judge': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/592450/headshot/67/current',
-                'Jazz Chisholm Jr.': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/665862/headshot/67/current',
-                'Juan Soto': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/665742/headshot/67/current',
-                'Shohei Ohtani': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660271/headshot/67/current',
-                'Kyle Schwarber': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/656941/headshot/67/current',
-                'Ronald Acuña Jr.': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660670/headshot/67/current',
-                'Pete Alonso': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/624413/headshot/67/current',
-                'Bryce Harper': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/547180/headshot/67/current'
-            };
-            
-            if (headshots[playerData.name]) {
-                embed.setThumbnail(headshots[playerData.name]);
-            }
-
-            await channel.send({ embeds: [embed] });
-            console.log(`Sent home run alert for ${playerData.name}! Total: ${totalHomeRuns}, Distance: ${details.distance}, RBI: ${details.rbi}`);
-        } catch (error) {
-            console.error('Error sending message:', error.message);
+        // Set player headshot using MLB's official headshot URLs
+        const headshots = {
+            'Aaron Judge': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/592450/headshot/67/current',
+            'Jazz Chisholm Jr.': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/665862/headshot/67/current',
+            'Juan Soto': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/665742/headshot/67/current',
+            'Shohei Ohtani': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660271/headshot/67/current',
+            'Kyle Schwarber': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/656941/headshot/67/current',
+            'Ronald Acuña Jr.': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660670/headshot/67/current',
+            'Pete Alonso': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/624413/headshot/67/current',
+            'Bryce Harper': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/547180/headshot/67/current'
+        };
+        
+        if (headshots[playerData.name]) {
+            embed.setThumbnail(headshots[playerData.name]);
         }
+
+        // Send to all configured channels
+        let successCount = 0;
+        for (const channelId of this.channelIds) {
+            try {
+                const channel = await this.client.channels.fetch(channelId);
+                await channel.send({ embeds: [embed] });
+                this.log(`✅ Successfully sent alert to channel ${channelId}`);
+                successCount++;
+            } catch (error) {
+                this.log(`❌ Error sending message to channel ${channelId}: ${error.message}`);
+                console.error(`Full error for channel ${channelId}:`, error);
+            }
+        }
+        
+        this.log(`📊 Alert summary: ${successCount}/${this.channelIds.length} channels notified for ${playerData.name} (Total: ${totalHomeRuns} HR, Distance: ${details.distance})`);
     }
 
     startMonitoring() {
@@ -208,12 +250,14 @@ class BaseballBot {
             const month = now.getMonth() + 1;
             
             if (month >= 4 && month <= 10) {
-                console.log('Checking for new home runs...');
                 await this.checkForNewHomeRuns();
+            } else {
+                this.log('Outside baseball season, skipping check');
             }
         });
         
-        console.log('Started monitoring for home runs from your selected star players!');
+        this.log('Started monitoring for home runs from your selected star players!');
+        this.log('Checking every 5 minutes during baseball season (April-October)');
     }
 
     async handleCommand(message) {
@@ -267,6 +311,73 @@ class BaseballBot {
         if (content === '!testhr') {
             await this.sendTestHomeRunAlert(message);
         }
+        
+        // NEW DEBUG COMMANDS
+        if (content === '!debug') {
+            await this.sendDebugInfo(message);
+        }
+        
+        if (content === '!forcecheck') {
+            await message.reply('Running manual home run check...');
+            await this.checkForNewHomeRuns();
+            await message.reply('Manual check completed! Check console logs for details.');
+        }
+        
+        // Force reset a player's HR count (useful for testing)
+        if (content.startsWith('!reset ')) {
+            const playerName = content.split(' ')[1];
+            await this.resetPlayerHR(playerName, message);
+        }
+    }
+
+    async sendDebugInfo(message) {
+        try {
+            const debugInfo = [];
+            debugInfo.push(`**Bot Status:**`);
+            debugInfo.push(`- Last check: ${this.lastCheckTime ? this.lastCheckTime.toISOString() : 'Never'}`);
+            debugInfo.push(`- Current season: ${this.currentSeason}`);
+            debugInfo.push(`- Debugging enabled: ${this.debugging}`);
+            debugInfo.push(`- Alert channels: ${this.channelIds.length} (${this.channelIds.join(', ')})`);
+            debugInfo.push(`\n**Player Tracking:**`);
+            
+            for (const [playerId, playerData] of Object.entries(this.players)) {
+                const currentHR = await this.getPlayerHomeRuns(playerId);
+                debugInfo.push(`- ${playerData.name}: Tracked=${playerData.lastCheckedHR}, Current=${currentHR}`);
+            }
+
+            const embed = new Discord.EmbedBuilder()
+                .setTitle('🔧 Debug Information')
+                .setDescription(debugInfo.join('\n'))
+                .setColor('#FFA500')
+                .setTimestamp();
+
+            await message.reply({ embeds: [embed] });
+        } catch (error) {
+            this.log(`Error in debug command: ${error.message}`);
+            await message.reply('Error getting debug info!');
+        }
+    }
+
+    async resetPlayerHR(playerName, message) {
+        try {
+            const playerId = Object.keys(this.players).find(id => 
+                this.players[id].name.toLowerCase().includes(playerName.toLowerCase())
+            );
+            
+            if (!playerId) {
+                await message.reply(`Player "${playerName}" not found!`);
+                return;
+            }
+            
+            const oldValue = this.players[playerId].lastCheckedHR;
+            this.players[playerId].lastCheckedHR = 0;
+            this.log(`Reset ${this.players[playerId].name} HR count from ${oldValue} to 0 (manual reset)`);
+            
+            await message.reply(`Reset ${this.players[playerId].name}'s tracked HR count from ${oldValue} to 0. Next check will detect any current HRs as new.`);
+        } catch (error) {
+            this.log(`Error in reset command: ${error.message}`);
+            await message.reply('Error resetting player HR count!');
+        }
     }
 
     async sendPlayerStats(playerId, message) {
@@ -284,7 +395,8 @@ class BaseballBot {
                 .addFields(
                     { name: '⚾ Hitting', value: `**AVG:** ${stats.avg || 'N/A'} | **HR:** ${stats.homeRuns || 0} | **RBI:** ${stats.rbi || 0} | **R:** ${stats.runs || 0}`, inline: false },
                     { name: '📊 Advanced', value: `**OBP:** ${stats.obp || 'N/A'} | **SLG:** ${stats.slg || 'N/A'} | **OPS:** ${stats.ops || 'N/A'}`, inline: false },
-                    { name: '🏃 Other', value: `**H:** ${stats.hits || 0} | **AB:** ${stats.atBats || 0} | **SB:** ${stats.stolenBases || 0} | **SO:** ${stats.strikeOuts || 0} | **BB:** ${stats.baseOnBalls || 0}`, inline: false }
+                    { name: '🏃 Other', value: `**H:** ${stats.hits || 0} | **AB:** ${stats.atBats || 0} | **SB:** ${stats.stolenBases || 0} | **SO:** ${stats.strikeOuts || 0} | **BB:** ${stats.baseOnBalls || 0}`, inline: false },
+                    { name: '🤖 Bot Tracking', value: `**Last Checked:** ${this.players[playerId].lastCheckedHR} HR`, inline: false }
                 )
                 .setColor('#132448')
                 .setTimestamp()
@@ -322,7 +434,10 @@ class BaseballBot {
             .setTitle('📊 Tracked Players')
             .setDescription(`Currently monitoring these players for home runs:\n\n${playerList}`)
             .addFields(
-                { name: 'Available Commands', value: '!judge, !jazz, !soto, !ohtani, !schwarber, !acuna, !alonso, !harper, !hrstats, !testhr', inline: false }
+                { name: 'Player Commands', value: '!judge, !jazz, !soto, !ohtani, !schwarber, !acuna, !alonso, !harper', inline: false },
+                { name: 'General Commands', value: '!hrstats, !testhr, !players', inline: false },
+                { name: 'Debug Commands', value: '!debug, !forcecheck, !reset [player]', inline: false },
+                { name: 'Alert Channels', value: `Sending to ${this.channelIds.length} channel(s)`, inline: false }
             )
             .setColor('#132448')
             .setTimestamp();
@@ -339,7 +454,8 @@ class BaseballBot {
                 hrStats.push({
                     name: playerData.name,
                     team: playerData.team,
-                    homeRuns: homeRuns
+                    homeRuns: homeRuns,
+                    tracked: playerData.lastCheckedHR
                 });
             }
             
@@ -347,14 +463,15 @@ class BaseballBot {
             hrStats.sort((a, b) => b.homeRuns - a.homeRuns);
             
             const statsText = hrStats
-                .map((player, index) => `${index + 1}. ${player.name} (${player.team}): ${player.homeRuns} HR`)
+                .map((player, index) => `${index + 1}. ${player.name} (${player.team}): ${player.homeRuns} HR (tracking: ${player.tracked})`)
                 .join('\n');
 
             const embed = new Discord.EmbedBuilder()
                 .setTitle(`🏆 ${this.currentSeason} Home Run Leaderboard`)
                 .setDescription(statsText)
                 .setColor('#FFD700')
-                .setTimestamp();
+                .setTimestamp()
+                .setFooter({ text: 'Numbers in parentheses show what the bot last recorded' });
 
             await message.reply({ embeds: [embed] });
         } catch (error) {
@@ -385,62 +502,37 @@ class BaseballBot {
                 rbiDescription: randomHRType
             };
             
-            const channel = message.channel;
+            // Use the multi-channel alert system for test
+            await this.sendHomeRunAlert(playerData, Math.floor(Math.random() * 40) + 10, 1, testDetails);
             
-            // Create dynamic title based on HR type
-            const hrType = testDetails.rbiDescription;
-            const titleText = hrType === 'Grand Slam!' ? 
-                `⚾ ${playerData.name.toUpperCase()} GRAND SLAM! ⚾` :
-                `⚾ ${playerData.name.toUpperCase()} ${hrType.toUpperCase().replace(' HR', ' HOME RUN')}! ⚾`;
-            
-            const embed = new Discord.EmbedBuilder()
-                .setTitle(titleText)
-                .setDescription(`${playerData.name} just hit a home run! (This is a test alert)`)
-                .addFields(
-                    { name: 'Player', value: `${playerData.name} (#${playerData.number})`, inline: true },
-                    { name: 'Team', value: playerData.team, inline: true },
-                    { name: 'Season Total', value: `${Math.floor(Math.random() * 40) + 10} HR`, inline: true },
-                    { name: 'Distance', value: testDetails.distance, inline: true }
-                )
-                .setColor('#132448')
-                .setTimestamp()
-                .setFooter({ text: '🧪 This is a test alert to show you what home run notifications will look like!' });
-
-            // Set player headshot
-            const headshots = {
-                'Aaron Judge': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/592450/headshot/67/current',
-                'Jazz Chisholm Jr.': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/665862/headshot/67/current',
-                'Juan Soto': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/665742/headshot/67/current',
-                'Shohei Ohtani': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660271/headshot/67/current',
-                'Kyle Schwarber': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/656941/headshot/67/current',
-                'Ronald Acuña Jr.': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660670/headshot/67/current',
-                'Pete Alonso': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/624413/headshot/67/current',
-                'Bryce Harper': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/547180/headshot/67/current'
-            };
-            
-            if (headshots[playerData.name]) {
-                embed.setThumbnail(headshots[playerData.name]);
-            }
-
-            await channel.send({ embeds: [embed] });
-            console.log(`Sent test home run alert for ${playerData.name}!`);
+            await message.reply(`🧪 Test alert sent to ${this.channelIds.length} channel(s) for ${playerData.name}! Check the logs for delivery status.`);
         } catch (error) {
-            console.error('Error sending test message:', error.message);
+            this.log(`Error sending test message: ${error.message}`);
             await message.reply('Sorry, I had trouble sending the test alert!');
         }
     }
 }
 
-// Usage
+// Usage - Parse multiple channel IDs from environment
 const botToken = process.env.BOT_TOKEN;
-const channelId = process.env.CHANNEL_ID;
+const channelIdString = process.env.CHANNEL_ID;
 
-if (!botToken || !channelId) {
+if (!botToken || !channelIdString) {
     console.error('Missing required environment variables: BOT_TOKEN and/or CHANNEL_ID');
     process.exit(1);
 }
 
-const bot = new BaseballBot(botToken, channelId);
+// Parse comma-separated channel IDs
+const channelIds = channelIdString.split(',').map(id => id.trim()).filter(id => id.length > 0);
+
+if (channelIds.length === 0) {
+    console.error('No valid channel IDs found in CHANNEL_ID environment variable');
+    process.exit(1);
+}
+
+console.log(`Starting bot with ${channelIds.length} channel(s): ${channelIds.join(', ')}`);
+
+const bot = new BaseballBot(botToken, channelIds);
 
 process.on('SIGTERM', () => {
     console.log('Received SIGTERM, shutting down gracefully');
