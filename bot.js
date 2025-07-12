@@ -502,10 +502,44 @@ class BaseballBot {
                 rbiDescription: randomHRType
             };
             
-            // Use the multi-channel alert system for test
-            await this.sendHomeRunAlert(playerData, Math.floor(Math.random() * 40) + 10, 1, testDetails);
+            // Create the embed for test (same as sendHomeRunAlert but only send to current channel)
+            const hrType = testDetails.rbiDescription || 'Solo HR';
+            const titleText = hrType === 'Grand Slam!' ? 
+                `⚾ ${playerData.name.toUpperCase()} GRAND SLAM! ⚾` :
+                `⚾ ${playerData.name.toUpperCase()} ${hrType.toUpperCase().replace(' HR', ' HOME RUN')}! ⚾`;
             
-            await message.reply(`🧪 Test alert sent to ${this.channelIds.length} channel(s) for ${playerData.name}! Check the logs for delivery status.`);
+            const embed = new Discord.EmbedBuilder()
+                .setTitle(titleText)
+                .setDescription(`${playerData.name} just hit a home run! (TEST ALERT)`)
+                .addFields(
+                    { name: 'Player', value: `${playerData.name} (#${playerData.number})`, inline: true },
+                    { name: 'Team', value: playerData.team, inline: true },
+                    { name: 'Season Total', value: `${Math.floor(Math.random() * 40) + 10} HR`, inline: true },
+                    { name: 'Distance', value: testDetails.distance, inline: true }
+                )
+                .setColor('#132448')
+                .setTimestamp();
+
+            // Set player headshot using MLB's official headshot URLs
+            const headshots = {
+                'Aaron Judge': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/592450/headshot/67/current',
+                'Jazz Chisholm Jr.': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/665862/headshot/67/current',
+                'Juan Soto': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/665742/headshot/67/current',
+                'Shohei Ohtani': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660271/headshot/67/current',
+                'Kyle Schwarber': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/656941/headshot/67/current',
+                'Ronald Acuña Jr.': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660670/headshot/67/current',
+                'Pete Alonso': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/624413/headshot/67/current',
+                'Bryce Harper': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/547180/headshot/67/current'
+            };
+            
+            if (headshots[playerData.name]) {
+                embed.setThumbnail(headshots[playerData.name]);
+            }
+
+            // Send only to the current channel where the command was issued
+            await message.channel.send({ embeds: [embed] });
+            
+            await message.reply(`🧪 Test alert sent to this channel for ${playerData.name}!`);
         } catch (error) {
             this.log(`Error sending test message: ${error.message}`);
             await message.reply('Sorry, I had trouble sending the test alert!');
