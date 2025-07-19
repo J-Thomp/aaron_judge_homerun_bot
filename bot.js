@@ -617,6 +617,23 @@ class BaseballBot {
                 await message.reply('Usage: !debuggame [gameId] [playerName]');
             }
         }
+        
+        // Test specific game with embed output
+        if (content.startsWith('!testgame ')) {
+            const parts = content.split(' ');
+            if (parts.length >= 3) {
+                const gameId = parts[1];
+                const playerName = parts.slice(2).join(' ');
+                await this.testSpecificGame(gameId, playerName, message);
+            } else {
+                await message.reply('Usage: !testgame [gameId] [playerName]');
+            }
+        }
+        
+        // Find recent home runs with distance data
+        if (content === '!findrecent') {
+            await this.findRecentHomeRunsWithDistance(message);
+        }
     }
 
     async sendDebugInfo(message) {
@@ -1103,6 +1120,122 @@ class BaseballBot {
         }
     }
 
+    async testSpecificGame(gameId, playerName, message) {
+        try {
+            const playerId = Object.keys(this.players).find(id => 
+                this.players[id].name.toLowerCase().includes(playerName.toLowerCase())
+            );
+            
+            if (!playerId) {
+                await message.reply(`Player "${playerName}" not found!`);
+                return;
+            }
+            
+            await message.reply(`🔍 Testing game ${gameId} for ${this.players[playerId].name}...`);
+            
+            // Use the debug method
+            await this.debugTestSpecificGame(gameId, playerId);
+            
+            // Also test the actual extraction
+            const response = await axios.get(
+                `https://statsapi.mlb.com/api/v1/game/${gameId}/playByPlay`
+            );
+            
+            const plays = response.data.allPlays || [];
+            let found = false;
+            
+            for (const play of plays) {
+                if (this.isHomeRunByPlayer(play, playerId)) {
+                    found = true;
+                    const distance = this.extractDistanceFromPlay(play);
+                    const rbiInfo = this.extractRBIInfo(play);
+                    
+                    const embed = new Discord.EmbedBuilder()
+                        .setTitle(`⚾ Home Run Found!`)
+                        .setDescription(play.result?.description || 'No description')
+                        .addFields(
+                            { name: 'Distance', value: distance, inline: true },
+                            { name: 'RBI', value: `${rbiInfo.rbi} (${rbiInfo.rbiDescription})`, inline: true },
+                            { name: 'Game ID', value: gameId.toString(), inline: true }
+                        )
+                        .setColor('#00FF00')
+                        .setTimestamp();
+                    
+                    await message.reply({ embeds: [embed] });
+                }
+            }
+            
+            if (!found) {
+                await message.reply(`No home runs found for ${this.players[playerId].name} in game ${gameId}`);
+            }
+            
+        } catch (error) {
+            await message.reply(`Error testing game: ${error.message}`);
+        }
+    }
+
+    async findRecentHomeRunsWithDistance(message) {
+        try {
+            await message.reply('🔍 Finding recent home runs with distance data...');
+            
+            const results = [];
+            
+            for (const [playerId, playerData] of Object.entries(this.players)) {
+                const response = await axios.get(
+                    `https://statsapi.mlb.com/api/v1/people/${playerId}/stats?stats=gameLog&season=${this.currentSeason}&group=hitting&gameType=R`
+                );
+                
+                if (response.data.stats?.[0]?.splits) {
+                    const hrGame = response.data.stats[0].splits
+                        .find(game => game.stat.homeRuns > 0);
+                    
+                    if (hrGame) {
+                        const gameId = hrGame.game?.gamePk;
+                        if (gameId) {
+                            try {
+                                const details = await this.getRecentHomeRunDetails(playerId);
+                                results.push({
+                                    player: playerData.name,
+                                    date: hrGame.date,
+                                    gameId: gameId,
+                                    distance: details.distance,
+                                    rbi: details.rbiDescription
+                                });
+                            } catch (err) {
+                                this.log(`Error getting details for ${playerData.name}: ${err.message}`);
+                            }
+                        }
+                    }
+                }
+                
+                // Rate limit
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+            
+            if (results.length > 0) {
+                const embed = new Discord.EmbedBuilder()
+                    .setTitle('🏆 Recent Home Runs with Distance Data')
+                    .setColor('#FFD700')
+                    .setTimestamp();
+                
+                results.forEach(r => {
+                    embed.addFields({
+                        name: `${r.player} - ${r.date}`,
+                        value: `Distance: ${r.distance}\nType: ${r.rbi}\nGame: ${r.gameId}`,
+                        inline: false
+                    });
+                });
+                
+                await message.reply({ embeds: [embed] });
+            } else {
+                await message.reply('No recent home runs found with distance data');
+            }
+            
+        } catch (error) {
+            await message.reply(`Error finding recent home runs: ${error.message}`);
+        }
+    }
+
     async sendPlayerStats(playerId, message) {
         try {
             const stats = await this.getPlayerStats(playerId);
@@ -1159,7 +1292,7 @@ class BaseballBot {
             .addFields(
                 { name: 'Player Commands', value: '!judge, !jazz, !soto, !ohtani, !schwarber, !acuna, !alonso, !harper', inline: false },
                 { name: 'General Commands', value: '!hrstats, !testhr, !players', inline: false },
-                { name: 'Debug Commands', value: '!debug, !forcecheck, !reset [player], !testdetails [player], !testrbi [player], !testdistance [player], !debuggame [gameId] [player]', inline: false },
+                { name: 'Debug Commands', value: '!debug, !forcecheck, !reset [player], !testdetails [player], !testrbi [player], !testdistance [player], !debuggame [gameId] [player], !testgame [gameId] [player], !findrecent', inline: false },
                 { name: 'Alert Channels', value: `Sending to ${this.channelIds.length} channel(s)`, inline: false }
             )
             .setColor('#132448')
