@@ -107,25 +107,26 @@ class BaseballBot {
             for (const date of gamesResponse.data.dates) {
                 for (const game of date.games) {
                     try {
-                        // Get detailed game data
+                        // IMPORTANT: Use playByPlay endpoint instead of feed/live
                         const gameDetailResponse = await axios.get(
-                            `https://statsapi.mlb.com/api/v1/game/${game.gameId}/feed/live`
+                            `https://statsapi.mlb.com/api/v1/game/${game.gameId}/playByPlay`
                         );
                         
                         const gameData = gameDetailResponse.data;
-                        if (!gameData.liveData || !gameData.liveData.plays || !gameData.liveData.plays.allPlays) {
-                            continue;
+                        if (!gameData.allPlays) {
+                            // Fallback to feed/live if playByPlay doesn't work
+                            const liveFeedResponse = await axios.get(
+                                `https://statsapi.mlb.com/api/v1/game/${game.gameId}/feed/live`
+                            );
+                            gameData.allPlays = liveFeedResponse.data.liveData?.plays?.allPlays || [];
                         }
 
                         // Look for home runs by this player
-                        const plays = gameData.liveData.plays.allPlays;
+                        const plays = gameData.allPlays || [];
                         for (const play of plays.reverse()) {
-                            // Check if this is a home run by our player
-                            const isHomeRun = this.isHomeRunPlay(play, playerId);
-                            
-                            if (isHomeRun) {
-                                // Extract distance
-                                const distance = this.extractDistance(play);
+                            if (this.isHomeRunByPlayer(play, playerId)) {
+                                // Extract distance using the correct path
+                                const distance = this.extractDistanceFromPlay(play);
                                 
                                 // Extract RBI information
                                 const rbiInfo = this.extractRBIInfo(play);
@@ -147,7 +148,7 @@ class BaseballBot {
                 }
             }
             
-            // If we didn't find details in play-by-play, try alternative method
+            // If we didn't find details, try alternative method
             return await this.getHomeRunDetailsFromAlternativeAPI(playerId);
         } catch (error) {
             this.log(`Error fetching home run details: ${error.message}`);
@@ -155,70 +156,66 @@ class BaseballBot {
         }
     }
 
-    // Add this new helper method to check if a play is a home run
-    isHomeRunPlay(play, playerId) {
-        if (!play.result || !play.matchup || !play.matchup.batter) {
-            return false;
-        }
-        
-        // Check if batter matches our player
-        if (play.matchup.batter.id.toString() !== playerId) {
+    // Updated helper method to check if a play is a home run
+    isHomeRunByPlayer(play, playerId) {
+        // Check if it's the right player
+        const batterId = play.matchup?.batter?.id || play.result?.batter?.id;
+        if (batterId?.toString() !== playerId) {
             return false;
         }
         
         // Check multiple fields for home run indication
         const isHomeRun = 
-            play.result.event === 'Home Run' || 
-            play.result.eventType === 'home_run' ||
-            (play.result.description && play.result.description.toLowerCase().includes('homers')) ||
-            (play.result.description && play.result.description.toLowerCase().includes('home run')) ||
-            (play.result.type && play.result.type.displayName === 'Home Run');
+            play.result?.event === 'Home Run' || 
+            play.result?.eventType === 'home_run' ||
+            play.result?.type === 'home_run' ||
+            (play.result?.description && play.result.description.toLowerCase().includes('homers')) ||
+            (play.result?.description && play.result.description.toLowerCase().includes('home run'));
         
         return isHomeRun;
     }
 
-    // Add this new method to extract distance more reliably
-    extractDistance(play) {
+    // CRITICAL FIX: Updated method to extract distance from the correct location
+    extractDistanceFromPlay(play) {
         let distance = "Distance not available";
         
-        // Priority 1: Check hitData fields
-        if (play.hitData) {
-            if (play.hitData.totalDistance) {
-                distance = `${Math.round(play.hitData.totalDistance)} ft`;
-            } else if (play.hitData.launchDistance) {
-                distance = `${Math.round(play.hitData.launchDistance)} ft`;
+        // Priority 1: Check playEvents array (THIS IS WHERE THE DATA ACTUALLY IS!)
+        if (play.playEvents && Array.isArray(play.playEvents)) {
+            for (const event of play.playEvents) {
+                if (event.hitData && event.hitData.totalDistance) {
+                    distance = `${Math.round(event.hitData.totalDistance)} ft`;
+                    this.log(`Found distance in playEvents: ${distance}`);
+                    break;
+                }
             }
         }
         
-        // Priority 2: Parse from description
-        if (distance === "Distance not available" && play.result && play.result.description) {
-            // Look for patterns like "425 feet", "425-foot", "(425 ft)"
+        // Priority 2: Check hitData at play level (rarely populated)
+        if (distance === "Distance not available" && play.hitData) {
+            if (play.hitData.totalDistance) {
+                distance = `${Math.round(play.hitData.totalDistance)} ft`;
+                this.log(`Found distance in play.hitData: ${distance}`);
+            } else if (play.hitData.launchDistance) {
+                distance = `${Math.round(play.hitData.launchDistance)} ft`;
+                this.log(`Found launch distance: ${distance}`);
+            }
+        }
+        
+        // Priority 3: Parse from description as last resort
+        if (distance === "Distance not available" && play.result?.description) {
             const patterns = [
                 /(\d{3,4})\s*(?:feet|foot|ft)/i,
                 /\((\d{3,4})\s*ft\)/i,
-                /(\d{3,4})-foot/i
+                /(\d{3,4})-foot/i,
+                /traveled\s*(\d{3,4})/i
             ];
             
             for (const pattern of patterns) {
                 const match = play.result.description.match(pattern);
                 if (match && match[1]) {
                     distance = `${match[1]} ft`;
+                    this.log(`Found distance in description: ${distance}`);
                     break;
-                }
-            }
-        }
-        
-        // Priority 3: Check playEvents for distance info
-        if (distance === "Distance not available" && play.playEvents) {
-            for (const event of play.playEvents) {
-                if (event.hitData) {
-                    if (event.hitData.totalDistance) {
-                        distance = `${Math.round(event.hitData.totalDistance)} ft`;
-                        break;
-                    } else if (event.hitData.launchDistance) {
-                        distance = `${Math.round(event.hitData.launchDistance)} ft`;
-                        break;
-                    }
                 }
             }
         }
@@ -226,17 +223,31 @@ class BaseballBot {
         return distance;
     }
 
-    // Add this new method to extract RBI information more accurately
+    // Updated RBI extraction with better detection
     extractRBIInfo(play) {
         let rbi = 1; // Default to solo HR
         let rbiDescription = "Solo HR";
         
         // Priority 1: Check result.rbi field
-        if (play.result && play.result.rbi && play.result.rbi > 0) {
+        if (play.result && typeof play.result.rbi === 'number' && play.result.rbi > 0) {
             rbi = play.result.rbi;
+            this.log(`Found RBI in result.rbi: ${rbi}`);
         } 
-        // Priority 2: Parse from description
-        else if (play.result && play.result.description) {
+        // Priority 2: Check runners who scored
+        else if (play.runners && Array.isArray(play.runners)) {
+            // Count runners who scored (including the batter)
+            const scoringRunners = play.runners.filter(runner => 
+                runner.movement && 
+                (runner.movement.end === 'score' || runner.movement.outBase === 'score')
+            );
+            
+            if (scoringRunners.length > 0) {
+                rbi = scoringRunners.length;
+                this.log(`Found ${rbi} scoring runners`);
+            }
+        }
+        // Priority 3: Parse from description
+        else if (play.result?.description) {
             const desc = play.result.description.toLowerCase();
             
             // Check for explicit mentions
@@ -249,23 +260,11 @@ class BaseballBot {
             } else if (desc.includes('solo')) {
                 rbi = 1;
             } else {
-                // Try to count runners mentioned in description
-                const runnersScored = this.countRunnersFromDescription(desc);
-                if (runnersScored > 0) {
-                    rbi = runnersScored + 1; // +1 for the batter
-                }
-            }
-        }
-        
-        // Priority 3: Check runners on base at the time
-        if (rbi === 1 && play.matchup && play.matchup.splits) {
-            const runners = play.matchup.splits.menOnBase;
-            if (runners) {
-                if (runners === "Loaded") {
-                    rbi = 4;
-                } else if (runners === "Men_On") {
-                    // This is less specific, but at least 2 RBI
-                    rbi = 2;
+                // Count "scores" mentions
+                const scoreMatches = desc.match(/scores?/gi);
+                if (scoreMatches) {
+                    // The batter scores too, so count should include them
+                    rbi = Math.max(1, scoreMatches.length);
                 }
             }
         }
@@ -324,32 +323,29 @@ class BaseballBot {
                 
                 if (recentGames.length > 0) {
                     const mostRecentHRGame = recentGames[0];
-                    const gameId = mostRecentHRGame.game?.gamePk || mostRecentHRGame.gameId;
+                    const gameId = mostRecentHRGame.game?.gamePk;
                     
-                    // Try to get more detailed information from the game
                     if (gameId) {
                         try {
+                            // Try playByPlay endpoint first
                             const gameDetailResponse = await axios.get(
-                                `https://statsapi.mlb.com/api/v1/game/${gameId}/feed/live`
+                                `https://statsapi.mlb.com/api/v1/game/${gameId}/playByPlay`
                             );
                             
-                            const gameData = gameDetailResponse.data;
-                            if (gameData.liveData && gameData.liveData.plays && gameData.liveData.plays.allPlays) {
-                                const plays = gameData.liveData.plays.allPlays;
-                                
-                                // Find home runs by this player
-                                for (const play of plays.reverse()) {
-                                    if (this.isHomeRunPlay(play, playerId)) {
-                                        const distance = this.extractDistance(play);
-                                        const rbiInfo = this.extractRBIInfo(play);
-                                        
-                                        return {
-                                            distance: distance,
-                                            rbi: rbiInfo.rbi,
-                                            rbiDescription: rbiInfo.rbiDescription,
-                                            gameId: gameId
-                                        };
-                                    }
+                            const plays = gameDetailResponse.data.allPlays || [];
+                            
+                            // Find home runs by this player
+                            for (const play of plays.reverse()) {
+                                if (this.isHomeRunByPlayer(play, playerId)) {
+                                    const distance = this.extractDistanceFromPlay(play);
+                                    const rbiInfo = this.extractRBIInfo(play);
+                                    
+                                    return {
+                                        distance: distance,
+                                        rbi: rbiInfo.rbi,
+                                        rbiDescription: rbiInfo.rbiDescription,
+                                        gameId: gameId
+                                    };
                                 }
                             }
                         } catch (detailError) {
@@ -360,8 +356,6 @@ class BaseballBot {
                     // Fallback: estimate based on game stats
                     const totalRBI = mostRecentHRGame.stat.rbi || 1;
                     const homeRuns = mostRecentHRGame.stat.homeRuns || 1;
-                    
-                    // Rough estimate: divide total RBI by home runs
                     const avgRbiPerHR = Math.max(1, Math.round(totalRBI / homeRuns));
                     
                     return {
@@ -610,6 +604,18 @@ class BaseballBot {
         if (content.startsWith('!testdistance ')) {
             const playerName = content.split(' ')[1];
             await this.testDistanceData(playerName, message);
+        }
+        
+        // Debug specific game
+        if (content.startsWith('!debuggame ')) {
+            const parts = content.split(' ');
+            if (parts.length >= 3) {
+                const gameId = parts[1];
+                const playerName = parts[2];
+                await this.debugSpecificGame(gameId, playerName, message);
+            } else {
+                await message.reply('Usage: !debuggame [gameId] [playerName]');
+            }
         }
     }
 
@@ -1024,6 +1030,79 @@ class BaseballBot {
         }
     }
 
+    // Add this debug method to test with a specific game
+    async debugTestSpecificGame(gameId, playerId) {
+        try {
+            console.log(`\n🔍 Testing game ${gameId} for player ${playerId}...\n`);
+            
+            // Try playByPlay endpoint
+            const response = await axios.get(
+                `https://statsapi.mlb.com/api/v1/game/${gameId}/playByPlay`
+            );
+            
+            const plays = response.data.allPlays || [];
+            console.log(`Found ${plays.length} plays in game`);
+            
+            let homeRunCount = 0;
+            for (const play of plays) {
+                if (this.isHomeRunByPlayer(play, playerId)) {
+                    homeRunCount++;
+                    console.log(`\n⚾ Home Run #${homeRunCount}:`);
+                    console.log(`Description: ${play.result?.description}`);
+                    
+                    // Check playEvents
+                    if (play.playEvents) {
+                        console.log(`PlayEvents count: ${play.playEvents.length}`);
+                        for (let i = 0; i < play.playEvents.length; i++) {
+                            const event = play.playEvents[i];
+                            if (event.hitData) {
+                                console.log(`Event ${i} hitData:`, event.hitData);
+                            }
+                        }
+                    }
+                    
+                    const distance = this.extractDistanceFromPlay(play);
+                    const rbiInfo = this.extractRBIInfo(play);
+                    
+                    console.log(`Extracted Distance: ${distance}`);
+                    console.log(`Extracted RBI: ${rbiInfo.rbi} (${rbiInfo.rbiDescription})`);
+                }
+            }
+            
+            if (homeRunCount === 0) {
+                console.log('No home runs found for this player in this game');
+            }
+            
+        } catch (error) {
+            console.error(`Error testing game: ${error.message}`);
+        }
+    }
+
+    async debugSpecificGame(gameId, playerName, message) {
+        try {
+            const playerId = Object.keys(this.players).find(id => 
+                this.players[id].name.toLowerCase().includes(playerName.toLowerCase())
+            );
+            
+            if (!playerId) {
+                await message.reply(`Player "${playerName}" not found!`);
+                return;
+            }
+            
+            const playerData = this.players[playerId];
+            await message.reply(`🔍 Debugging game ${gameId} for ${playerData.name}...`);
+            
+            // Call the debug method
+            await this.debugTestSpecificGame(gameId, playerId);
+            
+            await message.reply(`✅ Debug complete! Check console for detailed output.`);
+            
+        } catch (error) {
+            this.log(`Error in debug specific game: ${error.message}`);
+            await message.reply('Error debugging specific game!');
+        }
+    }
+
     async sendPlayerStats(playerId, message) {
         try {
             const stats = await this.getPlayerStats(playerId);
@@ -1080,7 +1159,7 @@ class BaseballBot {
             .addFields(
                 { name: 'Player Commands', value: '!judge, !jazz, !soto, !ohtani, !schwarber, !acuna, !alonso, !harper', inline: false },
                 { name: 'General Commands', value: '!hrstats, !testhr, !players', inline: false },
-                { name: 'Debug Commands', value: '!debug, !forcecheck, !reset [player], !testdetails [player], !testrbi [player], !testdistance [player]', inline: false },
+                { name: 'Debug Commands', value: '!debug, !forcecheck, !reset [player], !testdetails [player], !testrbi [player], !testdistance [player], !debuggame [gameId] [player]', inline: false },
                 { name: 'Alert Channels', value: `Sending to ${this.channelIds.length} channel(s)`, inline: false }
             )
             .setColor('#132448')
