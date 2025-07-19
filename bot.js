@@ -92,15 +92,15 @@ class BaseballBot {
 
     async getRecentHomeRunDetails(playerId) {
         try {
-            // Get player's recent games - increased limit to find more recent home runs
+            // Get player's recent games
             const gamesResponse = await axios.get(
-                `https://statsapi.mlb.com/api/v1/people/${playerId}/gameLog?season=${this.currentSeason}&gameType=R&limit=10`
+                `https://statsapi.mlb.com/api/v1/people/${playerId}/gameLog?season=${this.currentSeason}&gameType=R&limit=20`
             );
             
             this.log(`Successfully fetched game log for player ${playerId}`);
             
             if (!gamesResponse.data.dates || gamesResponse.data.dates.length === 0) {
-                return { distance: "Distance not available", rbi: "RBI not available" };
+                return { distance: "Distance not available", rbi: 1, rbiDescription: "Solo HR" };
             }
 
             // Look through recent games for home runs
@@ -119,68 +119,23 @@ class BaseballBot {
 
                         // Look for home runs by this player
                         const plays = gameData.liveData.plays.allPlays;
-                        for (const play of plays.reverse()) { // Start with most recent plays
-                            // Enhanced home run detection - check multiple possible event types
-                            const isHomeRun = play.result && 
-                                (play.result.event === 'Home Run' || 
-                                 play.result.eventType === 'home_run' ||
-                                 (play.result.description && play.result.description.toLowerCase().includes('home run'))) &&
-                                play.matchup && play.matchup.batter && 
-                                play.matchup.batter.id.toString() === playerId;
+                        for (const play of plays.reverse()) {
+                            // Check if this is a home run by our player
+                            const isHomeRun = this.isHomeRunPlay(play, playerId);
                             
                             if (isHomeRun) {
+                                // Extract distance
+                                const distance = this.extractDistance(play);
                                 
-                                let distance = "Distance not available";
-                                let rbi = play.result.rbi || 0;
+                                // Extract RBI information
+                                const rbiInfo = this.extractRBIInfo(play);
                                 
-                                // Try to get distance from multiple possible locations in the API response
-                                if (play.hitData && play.hitData.totalDistance) {
-                                    distance = `${play.hitData.totalDistance} ft`;
-                                } else if (play.hitData && play.hitData.distance) {
-                                    distance = `${play.hitData.distance} ft`;
-                                } else if (play.result && play.result.description && play.result.description.includes('ft')) {
-                                    // Extract distance from description if available
-                                    const distanceMatch = play.result.description.match(/(\d+)\s*ft/);
-                                    if (distanceMatch) {
-                                        distance = `${distanceMatch[1]} ft`;
-                                    }
-                                } else if (play.result && play.result.distance) {
-                                    distance = `${play.result.distance} ft`;
-                                } else if (play.result && play.result.trajectory && play.result.trajectory.includes('ft')) {
-                                    // Try to extract from trajectory field
-                                    const distanceMatch = play.result.trajectory.match(/(\d+)\s*ft/);
-                                    if (distanceMatch) {
-                                        distance = `${distanceMatch[1]} ft`;
-                                    }
-                                }
-                                
-                                // Determine RBI description based on actual RBI count
-                                let rbiDescription;
-                                if (rbi === 1) {
-                                    rbiDescription = "Solo HR";
-                                } else if (rbi === 2) {
-                                    rbiDescription = "2-run HR";
-                                } else if (rbi === 3) {
-                                    rbiDescription = "3-run HR";
-                                } else if (rbi === 4) {
-                                    rbiDescription = "Grand Slam!";
-                                } else {
-                                    rbiDescription = "Solo HR"; // Default fallback
-                                }
-                                
-                                // Debug logging to understand API structure
-                                if (this.debugging) {
-                                    this.log(`Found HR for ${playerId}: RBI=${rbi}, Distance=${distance}`);
-                                    this.log(`Play result structure: ${JSON.stringify(play.result, null, 2)}`);
-                                    if (play.hitData) {
-                                        this.log(`Hit data structure: ${JSON.stringify(play.hitData, null, 2)}`);
-                                    }
-                                }
+                                this.log(`Found HR for ${playerId}: Distance=${distance}, RBI=${rbiInfo.rbi}, Type=${rbiInfo.rbiDescription}`);
                                 
                                 return { 
                                     distance: distance, 
-                                    rbi: rbi,
-                                    rbiDescription: rbiDescription,
+                                    rbi: rbiInfo.rbi,
+                                    rbiDescription: rbiInfo.rbiDescription,
                                     gameId: game.gameId
                                 };
                             }
@@ -192,68 +147,231 @@ class BaseballBot {
                 }
             }
             
-            return { distance: "Distance not available", rbi: "RBI not available" };
+            // If we didn't find details in play-by-play, try alternative method
+            return await this.getHomeRunDetailsFromAlternativeAPI(playerId);
         } catch (error) {
             this.log(`Error fetching home run details: ${error.message}`);
-            this.log(`Falling back to alternative API method...`);
-            
-            // If the primary method fails, try the alternative method immediately
-            try {
-                return await this.getHomeRunDetailsFromAlternativeAPI(playerId);
-            } catch (fallbackError) {
-                this.log(`Alternative method also failed: ${fallbackError.message}`);
-                return { distance: "Distance not available", rbi: 1, rbiDescription: "Solo HR" };
-            }
+            return await this.getHomeRunDetailsFromAlternativeAPI(playerId);
         }
     }
 
-    async getHomeRunDetailsFromAlternativeAPI(playerId) {
+    // Add this new helper method to check if a play is a home run
+    isHomeRunPlay(play, playerId) {
+        if (!play.result || !play.matchup || !play.matchup.batter) {
+            return false;
+        }
+        
+        // Check if batter matches our player
+        if (play.matchup.batter.id.toString() !== playerId) {
+            return false;
+        }
+        
+        // Check multiple fields for home run indication
+        const isHomeRun = 
+            play.result.event === 'Home Run' || 
+            play.result.eventType === 'home_run' ||
+            (play.result.description && play.result.description.toLowerCase().includes('homers')) ||
+            (play.result.description && play.result.description.toLowerCase().includes('home run')) ||
+            (play.result.type && play.result.type.displayName === 'Home Run');
+        
+        return isHomeRun;
+    }
+
+    // Add this new method to extract distance more reliably
+    extractDistance(play) {
+        let distance = "Distance not available";
+        
+        // Priority 1: Check hitData fields
+        if (play.hitData) {
+            if (play.hitData.totalDistance) {
+                distance = `${Math.round(play.hitData.totalDistance)} ft`;
+            } else if (play.hitData.launchDistance) {
+                distance = `${Math.round(play.hitData.launchDistance)} ft`;
+            }
+        }
+        
+        // Priority 2: Parse from description
+        if (distance === "Distance not available" && play.result && play.result.description) {
+            // Look for patterns like "425 feet", "425-foot", "(425 ft)"
+            const patterns = [
+                /(\d{3,4})\s*(?:feet|foot|ft)/i,
+                /\((\d{3,4})\s*ft\)/i,
+                /(\d{3,4})-foot/i
+            ];
+            
+            for (const pattern of patterns) {
+                const match = play.result.description.match(pattern);
+                if (match && match[1]) {
+                    distance = `${match[1]} ft`;
+                    break;
+                }
+            }
+        }
+        
+        // Priority 3: Check playEvents for distance info
+        if (distance === "Distance not available" && play.playEvents) {
+            for (const event of play.playEvents) {
+                if (event.hitData) {
+                    if (event.hitData.totalDistance) {
+                        distance = `${Math.round(event.hitData.totalDistance)} ft`;
+                        break;
+                    } else if (event.hitData.launchDistance) {
+                        distance = `${Math.round(event.hitData.launchDistance)} ft`;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        return distance;
+    }
+
+    // Add this new method to extract RBI information more accurately
+    extractRBIInfo(play) {
+        let rbi = 1; // Default to solo HR
+        let rbiDescription = "Solo HR";
+        
+        // Priority 1: Check result.rbi field
+        if (play.result && play.result.rbi && play.result.rbi > 0) {
+            rbi = play.result.rbi;
+        } 
+        // Priority 2: Parse from description
+        else if (play.result && play.result.description) {
+            const desc = play.result.description.toLowerCase();
+            
+            // Check for explicit mentions
+            if (desc.includes('grand slam')) {
+                rbi = 4;
+            } else if (desc.includes('3-run') || desc.includes('three-run')) {
+                rbi = 3;
+            } else if (desc.includes('2-run') || desc.includes('two-run')) {
+                rbi = 2;
+            } else if (desc.includes('solo')) {
+                rbi = 1;
+            } else {
+                // Try to count runners mentioned in description
+                const runnersScored = this.countRunnersFromDescription(desc);
+                if (runnersScored > 0) {
+                    rbi = runnersScored + 1; // +1 for the batter
+                }
+            }
+        }
+        
+        // Priority 3: Check runners on base at the time
+        if (rbi === 1 && play.matchup && play.matchup.splits) {
+            const runners = play.matchup.splits.menOnBase;
+            if (runners) {
+                if (runners === "Loaded") {
+                    rbi = 4;
+                } else if (runners === "Men_On") {
+                    // This is less specific, but at least 2 RBI
+                    rbi = 2;
+                }
+            }
+        }
+        
+        // Set description based on RBI count
+        switch(rbi) {
+            case 1:
+                rbiDescription = "Solo HR";
+                break;
+            case 2:
+                rbiDescription = "2-run HR";
+                break;
+            case 3:
+                rbiDescription = "3-run HR";
+                break;
+            case 4:
+                rbiDescription = "Grand Slam!";
+                break;
+            default:
+                rbiDescription = `${rbi}-run HR`;
+        }
+        
+        return { rbi, rbiDescription };
+    }
+
+    // Add this helper method to count runners from description
+    countRunnersFromDescription(description) {
+        let count = 0;
+        
+        // Look for phrases like "scores", "score", etc.
+        const scoreMatches = description.match(/(\w+)\s+scores?/gi);
+        if (scoreMatches) {
+            // Subtract 1 because the batter's name will be included
+            count = scoreMatches.length - 1;
+        }
+        
+        // Look for specific runner mentions
+        if (description.includes('scores from third') || description.includes('scores from 3rd')) count++;
+        if (description.includes('scores from second') || description.includes('scores from 2nd')) count++;
+        if (description.includes('scores from first') || description.includes('scores from 1st')) count++;
+        
+        return Math.max(0, count);
+    }
+
+        async getHomeRunDetailsFromAlternativeAPI(playerId) {
         try {
-            // Alternative approach: Get recent home runs from player's season stats
             const response = await axios.get(
                 `https://statsapi.mlb.com/api/v1/people/${playerId}/stats?stats=gameLog&season=${this.currentSeason}&group=hitting&gameType=R`
             );
             
-                            if (response.data.stats && response.data.stats[0] && response.data.stats[0].splits) {
-                    // Look for the most recent game with home runs
-                    const recentGames = response.data.stats[0].splits
-                        .filter(game => game.stat.homeRuns > 0)
-                        .sort((a, b) => new Date(b.date) - new Date(a.date));
+            if (response.data.stats && response.data.stats[0] && response.data.stats[0].splits) {
+                // Look for the most recent game with home runs
+                const recentGames = response.data.stats[0].splits
+                    .filter(game => game.stat.homeRuns > 0)
+                    .sort((a, b) => new Date(b.date) - new Date(a.date));
+                
+                if (recentGames.length > 0) {
+                    const mostRecentHRGame = recentGames[0];
+                    const gameId = mostRecentHRGame.game?.gamePk || mostRecentHRGame.gameId;
                     
-                    if (recentGames.length > 0) {
-                        const mostRecentHRGame = recentGames[0];
-                        const rbi = mostRecentHRGame.stat.rbi || 1;
-                        
-                        // Try to get game ID from multiple possible locations
-                        const gameId = mostRecentHRGame.gameId || mostRecentHRGame.game?.gameId || mostRecentHRGame.gamePk;
-                        
-                        // Try to get more accurate RBI data by checking if this was a multi-RBI game
-                        // If the player hit multiple home runs in one game, we need to be more careful
-                        if (mostRecentHRGame.stat.homeRuns > 1) {
-                            // Multiple HRs in one game - assume solo HRs unless we have better data
-                            return {
-                                distance: "Distance not available", // This endpoint doesn't provide distance
-                                rbi: mostRecentHRGame.stat.homeRuns, // Each HR is at least 1 RBI
-                                rbiDescription: this.getRbiDescription(mostRecentHRGame.stat.homeRuns),
-                                gameId: gameId
-                            };
-                        } else {
-                            // Single HR - use the game's total RBI as a proxy
-                            // Try to get distance from Statcast API if we have a game ID
-                            let distance = "Distance not available";
-                            if (gameId) {
-                                distance = await this.getDistanceFromStatcastAPI(playerId, gameId);
-                            }
+                    // Try to get more detailed information from the game
+                    if (gameId) {
+                        try {
+                            const gameDetailResponse = await axios.get(
+                                `https://statsapi.mlb.com/api/v1/game/${gameId}/feed/live`
+                            );
                             
-                            return {
-                                distance: distance,
-                                rbi: rbi,
-                                rbiDescription: this.getRbiDescription(rbi),
-                                gameId: gameId
-                            };
+                            const gameData = gameDetailResponse.data;
+                            if (gameData.liveData && gameData.liveData.plays && gameData.liveData.plays.allPlays) {
+                                const plays = gameData.liveData.plays.allPlays;
+                                
+                                // Find home runs by this player
+                                for (const play of plays.reverse()) {
+                                    if (this.isHomeRunPlay(play, playerId)) {
+                                        const distance = this.extractDistance(play);
+                                        const rbiInfo = this.extractRBIInfo(play);
+                                        
+                                        return {
+                                            distance: distance,
+                                            rbi: rbiInfo.rbi,
+                                            rbiDescription: rbiInfo.rbiDescription,
+                                            gameId: gameId
+                                        };
+                                    }
+                                }
+                            }
+                        } catch (detailError) {
+                            this.log(`Could not get detailed game data: ${detailError.message}`);
                         }
                     }
+                    
+                    // Fallback: estimate based on game stats
+                    const totalRBI = mostRecentHRGame.stat.rbi || 1;
+                    const homeRuns = mostRecentHRGame.stat.homeRuns || 1;
+                    
+                    // Rough estimate: divide total RBI by home runs
+                    const avgRbiPerHR = Math.max(1, Math.round(totalRBI / homeRuns));
+                    
+                    return {
+                        distance: "Distance not available",
+                        rbi: avgRbiPerHR,
+                        rbiDescription: this.getRbiDescription(avgRbiPerHR),
+                        gameId: gameId
+                    };
                 }
+            }
             
             return { distance: "Distance not available", rbi: 1, rbiDescription: "Solo HR" };
         } catch (error) {
