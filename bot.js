@@ -92,9 +92,9 @@ class BaseballBot {
 
     async getRecentHomeRunDetails(playerId) {
         try {
-            // Get player's recent games
+            // Get player's recent games - increased limit to find more recent home runs
             const gamesResponse = await axios.get(
-                `https://statsapi.mlb.com/api/v1/people/${playerId}/gameLog?season=${this.currentSeason}&gameType=R&limit=5`
+                `https://statsapi.mlb.com/api/v1/people/${playerId}/gameLog?season=${this.currentSeason}&gameType=R&limit=10`
             );
             
             if (!gamesResponse.data.dates || gamesResponse.data.dates.length === 0) {
@@ -118,24 +118,62 @@ class BaseballBot {
                         // Look for home runs by this player
                         const plays = gameData.liveData.plays.allPlays;
                         for (const play of plays.reverse()) { // Start with most recent plays
-                            if (play.result && play.result.type === 'atBat' && 
-                                play.result.event === 'Home Run' && 
+                            // Enhanced home run detection - check multiple possible event types
+                            const isHomeRun = play.result && 
+                                (play.result.event === 'Home Run' || 
+                                 play.result.eventType === 'home_run' ||
+                                 (play.result.description && play.result.description.toLowerCase().includes('home run'))) &&
                                 play.matchup && play.matchup.batter && 
-                                play.matchup.batter.id.toString() === playerId) {
+                                play.matchup.batter.id.toString() === playerId;
+                            
+                            if (isHomeRun) {
                                 
                                 let distance = "Distance not available";
                                 let rbi = play.result.rbi || 0;
                                 
-                                // Try to get distance from hit data
+                                // Try to get distance from multiple possible locations in the API response
                                 if (play.hitData && play.hitData.totalDistance) {
                                     distance = `${play.hitData.totalDistance} ft`;
+                                } else if (play.hitData && play.hitData.distance) {
+                                    distance = `${play.hitData.distance} ft`;
+                                } else if (play.result && play.result.description && play.result.description.includes('ft')) {
+                                    // Extract distance from description if available
+                                    const distanceMatch = play.result.description.match(/(\d+)\s*ft/);
+                                    if (distanceMatch) {
+                                        distance = `${distanceMatch[1]} ft`;
+                                    }
+                                } else if (play.result && play.result.distance) {
+                                    distance = `${play.result.distance} ft`;
+                                } else if (play.result && play.result.trajectory && play.result.trajectory.includes('ft')) {
+                                    // Try to extract from trajectory field
+                                    const distanceMatch = play.result.trajectory.match(/(\d+)\s*ft/);
+                                    if (distanceMatch) {
+                                        distance = `${distanceMatch[1]} ft`;
+                                    }
                                 }
                                 
-                                // Determine RBI description
-                                let rbiDescription = "solo HR";
-                                if (rbi === 2) rbiDescription = "2-run HR";
-                                else if (rbi === 3) rbiDescription = "3-run HR";
-                                else if (rbi === 4) rbiDescription = "Grand Slam!";
+                                // Determine RBI description based on actual RBI count
+                                let rbiDescription;
+                                if (rbi === 1) {
+                                    rbiDescription = "Solo HR";
+                                } else if (rbi === 2) {
+                                    rbiDescription = "2-run HR";
+                                } else if (rbi === 3) {
+                                    rbiDescription = "3-run HR";
+                                } else if (rbi === 4) {
+                                    rbiDescription = "Grand Slam!";
+                                } else {
+                                    rbiDescription = "Solo HR"; // Default fallback
+                                }
+                                
+                                // Debug logging to understand API structure
+                                if (this.debugging) {
+                                    this.log(`Found HR for ${playerId}: RBI=${rbi}, Distance=${distance}`);
+                                    this.log(`Play result structure: ${JSON.stringify(play.result, null, 2)}`);
+                                    if (play.hitData) {
+                                        this.log(`Hit data structure: ${JSON.stringify(play.hitData, null, 2)}`);
+                                    }
+                                }
                                 
                                 return { 
                                     distance: distance, 
@@ -159,6 +197,45 @@ class BaseballBot {
         }
     }
 
+    async getHomeRunDetailsFromAlternativeAPI(playerId) {
+        try {
+            // Alternative approach: Get recent home runs from player's season stats
+            const response = await axios.get(
+                `https://statsapi.mlb.com/api/v1/people/${playerId}/stats?stats=gameLog&season=${this.currentSeason}&group=hitting&gameType=R`
+            );
+            
+            if (response.data.stats && response.data.stats[0] && response.data.stats[0].splits) {
+                // Look for the most recent game with home runs
+                const recentGames = response.data.stats[0].splits
+                    .filter(game => game.stat.homeRuns > 0)
+                    .sort((a, b) => new Date(b.date) - new Date(a.date));
+                
+                if (recentGames.length > 0) {
+                    const mostRecentHRGame = recentGames[0];
+                    return {
+                        distance: "Distance not available", // This endpoint doesn't provide distance
+                        rbi: mostRecentHRGame.stat.rbi || 1,
+                        rbiDescription: this.getRbiDescription(mostRecentHRGame.stat.rbi || 1),
+                        gameId: mostRecentHRGame.gameId
+                    };
+                }
+            }
+            
+            return { distance: "Distance not available", rbi: 1, rbiDescription: "Solo HR" };
+        } catch (error) {
+            this.log(`Error in alternative HR details API: ${error.message}`);
+            return { distance: "Distance not available", rbi: 1, rbiDescription: "Solo HR" };
+        }
+    }
+
+    getRbiDescription(rbi) {
+        if (rbi === 1) return "Solo HR";
+        if (rbi === 2) return "2-run HR";
+        if (rbi === 3) return "3-run HR";
+        if (rbi === 4) return "Grand Slam!";
+        return "Solo HR"; // Default fallback
+    }
+
     async checkForNewHomeRuns() {
         this.lastCheckTime = new Date();
         this.log(`Starting home run check at ${this.lastCheckTime.toISOString()}`);
@@ -175,7 +252,14 @@ class BaseballBot {
                     const newHomeRuns = currentHomeRuns - playerData.lastCheckedHR;
                     this.log(`🚨 NEW HOME RUN DETECTED! ${playerData.name} went from ${playerData.lastCheckedHR} to ${currentHomeRuns} (+${newHomeRuns})`);
                     
-                    const homeRunDetails = await this.getRecentHomeRunDetails(playerId);
+                    let homeRunDetails = await this.getRecentHomeRunDetails(playerId);
+                    
+                    // If primary method didn't find details, try alternative API
+                    if (homeRunDetails.distance === "Distance not available" && homeRunDetails.rbi === "RBI not available") {
+                        this.log(`Primary method failed for ${playerData.name}, trying alternative API...`);
+                        homeRunDetails = await this.getHomeRunDetailsFromAlternativeAPI(playerId);
+                    }
+                    
                     await this.sendHomeRunAlert(playerData, currentHomeRuns, newHomeRuns, homeRunDetails);
                     this.players[playerId].lastCheckedHR = currentHomeRuns;
                     alertsSent++;
@@ -328,6 +412,12 @@ class BaseballBot {
             const playerName = content.split(' ')[1];
             await this.resetPlayerHR(playerName, message);
         }
+        
+        // Test home run details fetching for a specific player
+        if (content.startsWith('!testdetails ')) {
+            const playerName = content.split(' ')[1];
+            await this.testHomeRunDetails(playerName, message);
+        }
     }
 
     async sendDebugInfo(message) {
@@ -377,6 +467,34 @@ class BaseballBot {
         } catch (error) {
             this.log(`Error in reset command: ${error.message}`);
             await message.reply('Error resetting player HR count!');
+        }
+    }
+
+    async testHomeRunDetails(playerName, message) {
+        try {
+            const playerId = Object.keys(this.players).find(id => 
+                this.players[id].name.toLowerCase().includes(playerName.toLowerCase())
+            );
+            
+            if (!playerId) {
+                await message.reply(`Player "${playerName}" not found!`);
+                return;
+            }
+            
+            const playerData = this.players[playerId];
+            await message.reply(`Testing home run details fetching for ${playerData.name}...`);
+            
+            // Test primary method
+            const primaryDetails = await this.getRecentHomeRunDetails(playerId);
+            await message.reply(`Primary method results for ${playerData.name}:\nDistance: ${primaryDetails.distance}\nRBI: ${primaryDetails.rbi}\nType: ${primaryDetails.rbiDescription}`);
+            
+            // Test alternative method
+            const alternativeDetails = await this.getHomeRunDetailsFromAlternativeAPI(playerId);
+            await message.reply(`Alternative method results for ${playerData.name}:\nDistance: ${alternativeDetails.distance}\nRBI: ${alternativeDetails.rbi}\nType: ${alternativeDetails.rbiDescription}`);
+            
+        } catch (error) {
+            this.log(`Error in test details command: ${error.message}`);
+            await message.reply('Error testing home run details!');
         }
     }
 
@@ -436,7 +554,7 @@ class BaseballBot {
             .addFields(
                 { name: 'Player Commands', value: '!judge, !jazz, !soto, !ohtani, !schwarber, !acuna, !alonso, !harper', inline: false },
                 { name: 'General Commands', value: '!hrstats, !testhr, !players', inline: false },
-                { name: 'Debug Commands', value: '!debug, !forcecheck, !reset [player]', inline: false },
+                { name: 'Debug Commands', value: '!debug, !forcecheck, !reset [player], !testdetails [player]', inline: false },
                 { name: 'Alert Channels', value: `Sending to ${this.channelIds.length} channel(s)`, inline: false }
             )
             .setColor('#132448')
