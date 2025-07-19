@@ -97,6 +97,8 @@ class BaseballBot {
                 `https://statsapi.mlb.com/api/v1/people/${playerId}/gameLog?season=${this.currentSeason}&gameType=R&limit=10`
             );
             
+            this.log(`Successfully fetched game log for player ${playerId}`);
+            
             if (!gamesResponse.data.dates || gamesResponse.data.dates.length === 0) {
                 return { distance: "Distance not available", rbi: "RBI not available" };
             }
@@ -193,7 +195,15 @@ class BaseballBot {
             return { distance: "Distance not available", rbi: "RBI not available" };
         } catch (error) {
             this.log(`Error fetching home run details: ${error.message}`);
-            return { distance: "Distance not available", rbi: "RBI not available" };
+            this.log(`Falling back to alternative API method...`);
+            
+            // If the primary method fails, try the alternative method immediately
+            try {
+                return await this.getHomeRunDetailsFromAlternativeAPI(playerId);
+            } catch (fallbackError) {
+                this.log(`Alternative method also failed: ${fallbackError.message}`);
+                return { distance: "Distance not available", rbi: 1, rbiDescription: "Solo HR" };
+            }
         }
     }
 
@@ -225,13 +235,16 @@ class BaseballBot {
                             gameId: mostRecentHRGame.gameId
                         };
                     } else {
-                        // Single HR - use the game's total RBI as a proxy
-                        return {
-                            distance: "Distance not available", // This endpoint doesn't provide distance
-                            rbi: rbi,
-                            rbiDescription: this.getRbiDescription(rbi),
-                            gameId: mostRecentHRGame.gameId
-                        };
+                                            // Single HR - use the game's total RBI as a proxy
+                    // Try to get distance from Statcast API
+                    const distance = await this.getDistanceFromStatcastAPI(playerId, mostRecentHRGame.gameId);
+                    
+                    return {
+                        distance: distance,
+                        rbi: rbi,
+                        rbiDescription: this.getRbiDescription(rbi),
+                        gameId: mostRecentHRGame.gameId
+                    };
                     }
                 }
             }
@@ -249,6 +262,35 @@ class BaseballBot {
         if (rbi === 3) return "3-run HR";
         if (rbi === 4) return "Grand Slam!";
         return "Solo HR"; // Default fallback
+    }
+
+    async getDistanceFromStatcastAPI(playerId, gameId) {
+        try {
+            // Try to get distance from Statcast data (more reliable for distance)
+            const response = await axios.get(
+                `https://baseballsavant.mlb.com/statcast_search/csv?all=true&hfPT=&hfAB=&hfBBT=&hfPR=&hfZ=&stadium=&hfBBL=&hfNewZones=&hfGT=R%7CPO%7CS%7C&hfC=&hfSea=${this.currentSeason}%7C&hfSit=&player_type=batter&hfOuts=&opponent=&pitcher_throws=&batter_stands=&hfSA=&game_date_gt=&game_date_lt=&team=&position=&hfRO=&home_road=&hfInn=&min_pitches=0&min_results=0&group_by=name&sort_col=pitches&player_event_sort=h_launch_speed&sort_order=desc&min_launch_speed=&max_launch_speed=&min_launch_angle=&max_launch_angle=&min_distance=&max_distance=&min_hard_hit=&max_hard_hit=&min_barrel_batted_ball=&max_barrel_batted_ball=&min_batted_ball_events=&max_batted_ball_events=&game_date_gt=&game_date_lt=&batters_lookup%5B%5D=${playerId}&min_pitches=0&min_results=0&min_pas=0&type=details`
+            );
+            
+            // Parse CSV response to find home runs with distance
+            const lines = response.data.split('\n');
+            const headers = lines[0].split(',');
+            const distanceIndex = headers.findIndex(h => h.includes('distance'));
+            const gameIdIndex = headers.findIndex(h => h.includes('game_id'));
+            
+            if (distanceIndex !== -1 && gameIdIndex !== -1) {
+                for (let i = 1; i < lines.length; i++) {
+                    const values = lines[i].split(',');
+                    if (values[gameIdIndex] === gameId && values[distanceIndex] && values[distanceIndex] !== 'null') {
+                        return `${values[distanceIndex]} ft`;
+                    }
+                }
+            }
+            
+            return "Distance not available";
+        } catch (error) {
+            this.log(`Error fetching Statcast distance data: ${error.message}`);
+            return "Distance not available";
+        }
     }
 
     async checkForNewHomeRuns() {
@@ -439,6 +481,12 @@ class BaseballBot {
             const playerName = content.split(' ')[1];
             await this.testRBIDetection(playerName, message);
         }
+        
+        // Test distance data specifically
+        if (content.startsWith('!testdistance ')) {
+            const playerName = content.split(' ')[1];
+            await this.testDistanceData(playerName, message);
+        }
     }
 
     async sendDebugInfo(message) {
@@ -540,6 +588,8 @@ class BaseballBot {
                     `https://statsapi.mlb.com/api/v1/people/${playerId}/gameLog?season=${this.currentSeason}&gameType=R&limit=5`
                 );
                 
+                await message.reply(`🔗 API URL tested: https://statsapi.mlb.com/api/v1/people/${playerId}/gameLog?season=${this.currentSeason}&gameType=R&limit=5`);
+                
                 if (gamesResponse.data.dates && gamesResponse.data.dates.length > 0) {
                     const recentGames = gamesResponse.data.dates.slice(0, 2); // Just check first 2 dates
                     await message.reply(`📊 Found ${recentGames.length} recent game dates for ${playerData.name}`);
@@ -603,6 +653,77 @@ class BaseballBot {
                 }
             } catch (gamesError) {
                 await message.reply(`❌ Error fetching game log: ${gamesError.message}`);
+            }
+            
+            // Test the alternative API that's working
+            await message.reply(`🔍 Testing the working alternative API...`);
+            try {
+                const altResponse = await axios.get(
+                    `https://statsapi.mlb.com/api/v1/people/${playerId}/stats?stats=gameLog&season=${this.currentSeason}&group=hitting&gameType=R`
+                );
+                
+                await message.reply(`✅ Alternative API successful! Found ${altResponse.data.stats ? altResponse.data.stats.length : 0} stat entries`);
+                
+                if (altResponse.data.stats && altResponse.data.stats[0] && altResponse.data.stats[0].splits) {
+                    const gamesWithHR = altResponse.data.stats[0].splits.filter(game => game.stat.homeRuns > 0);
+                    await message.reply(`⚾ Found ${gamesWithHR.length} games with home runs`);
+                    
+                    if (gamesWithHR.length > 0) {
+                        const mostRecent = gamesWithHR[0];
+                        await message.reply(`📊 Most recent HR game: ${mostRecent.date}`);
+                        await message.reply(`Game ID: ${mostRecent.gameId}`);
+                        await message.reply(`Home Runs: ${mostRecent.stat.homeRuns}`);
+                        await message.reply(`RBI: ${mostRecent.stat.rbi}`);
+                        
+                        // Try to get detailed game data for this specific game
+                        await message.reply(`🔍 Attempting to get detailed game data for ${mostRecent.gameId}...`);
+                        try {
+                            const gameDetailResponse = await axios.get(
+                                `https://statsapi.mlb.com/api/v1/game/${mostRecent.gameId}/feed/live`
+                            );
+                            
+                            if (gameDetailResponse.data.liveData && gameDetailResponse.data.liveData.plays) {
+                                const allPlays = gameDetailResponse.data.liveData.plays.allPlays;
+                                const homeRunPlays = allPlays.filter(play => 
+                                    play.result && 
+                                    (play.result.event === 'Home Run' || 
+                                     play.result.eventType === 'home_run' ||
+                                     (play.result.description && play.result.description.toLowerCase().includes('home run'))) &&
+                                    play.matchup && play.matchup.batter && 
+                                    play.matchup.batter.id.toString() === playerId
+                                );
+                                
+                                await message.reply(`📋 Found ${homeRunPlays.length} home runs by ${playerData.name} in this game`);
+                                
+                                if (homeRunPlays.length > 0) {
+                                    const hrPlay = homeRunPlays[0];
+                                    await message.reply(`📊 Home run play details:`);
+                                    await message.reply(`Event: ${hrPlay.result?.event || 'N/A'}`);
+                                    await message.reply(`Description: ${hrPlay.result?.description || 'N/A'}`);
+                                    await message.reply(`RBI: ${hrPlay.result?.rbi || 'N/A'}`);
+                                    
+                                    if (hrPlay.hitData) {
+                                        await message.reply(`HitData available: ${Object.keys(hrPlay.hitData).join(', ')}`);
+                                        if (hrPlay.hitData.totalDistance) {
+                                            await message.reply(`✅ TotalDistance: ${hrPlay.hitData.totalDistance} ft`);
+                                        }
+                                        if (hrPlay.hitData.distance) {
+                                            await message.reply(`✅ Distance: ${hrPlay.hitData.distance} ft`);
+                                        }
+                                    } else {
+                                        await message.reply(`❌ No hitData available for this play`);
+                                    }
+                                }
+                            } else {
+                                await message.reply(`❌ No live data available for game ${mostRecent.gameId}`);
+                            }
+                        } catch (gameDetailError) {
+                            await message.reply(`❌ Error fetching game details: ${gameDetailError.message}`);
+                        }
+                    }
+                }
+            } catch (altError) {
+                await message.reply(`❌ Error with alternative API: ${altError.message}`);
             }
             
         } catch (error) {
@@ -678,6 +799,96 @@ class BaseballBot {
         }
     }
 
+    async testDistanceData(playerName, message) {
+        try {
+            const playerId = Object.keys(this.players).find(id => 
+                this.players[id].name.toLowerCase().includes(playerName.toLowerCase())
+            );
+            
+            if (!playerId) {
+                await message.reply(`Player "${playerName}" not found!`);
+                return;
+            }
+            
+            const playerData = this.players[playerId];
+            await message.reply(`🔍 Testing distance data for ${playerData.name}...`);
+            
+            // Get recent home run game
+            try {
+                const response = await axios.get(
+                    `https://statsapi.mlb.com/api/v1/people/${playerId}/stats?stats=gameLog&season=${this.currentSeason}&group=hitting&gameType=R`
+                );
+                
+                if (response.data.stats && response.data.stats[0] && response.data.stats[0].splits) {
+                    const gamesWithHR = response.data.stats[0].splits
+                        .filter(game => game.stat.homeRuns > 0)
+                        .sort((a, b) => new Date(b.date) - new Date(a.date))
+                        .slice(0, 3); // Test last 3 HR games
+                    
+                    if (gamesWithHR.length > 0) {
+                        await message.reply(`⚾ Testing distance data for ${gamesWithHR.length} recent home run games:`);
+                        
+                        for (const game of gamesWithHR) {
+                            await message.reply(`📅 Game: ${game.date} (ID: ${game.gameId})`);
+                            
+                            // Test Statcast distance
+                            const statcastDistance = await this.getDistanceFromStatcastAPI(playerId, game.gameId);
+                            await message.reply(`📊 Statcast Distance: ${statcastDistance}`);
+                            
+                            // Test game feed distance
+                            try {
+                                const gameFeedResponse = await axios.get(
+                                    `https://statsapi.mlb.com/api/v1/game/${game.gameId}/feed/live`
+                                );
+                                
+                                if (gameFeedResponse.data.liveData && gameFeedResponse.data.liveData.plays) {
+                                    const homeRunPlays = gameFeedResponse.data.liveData.plays.allPlays.filter(play => 
+                                        play.result && 
+                                        (play.result.event === 'Home Run' || 
+                                         play.result.eventType === 'home_run' ||
+                                         (play.result.description && play.result.description.toLowerCase().includes('home run'))) &&
+                                        play.matchup && play.matchup.batter && 
+                                        play.matchup.batter.id.toString() === playerId
+                                    );
+                                    
+                                    if (homeRunPlays.length > 0) {
+                                        const hrPlay = homeRunPlays[0];
+                                        let gameFeedDistance = "Not available";
+                                        
+                                        if (hrPlay.hitData && hrPlay.hitData.totalDistance) {
+                                            gameFeedDistance = `${hrPlay.hitData.totalDistance} ft`;
+                                        } else if (hrPlay.hitData && hrPlay.hitData.distance) {
+                                            gameFeedDistance = `${hrPlay.hitData.distance} ft`;
+                                        } else if (hrPlay.result && hrPlay.result.description && hrPlay.result.description.includes('ft')) {
+                                            const distanceMatch = hrPlay.result.description.match(/(\d+)\s*ft/);
+                                            if (distanceMatch) {
+                                                gameFeedDistance = `${distanceMatch[1]} ft`;
+                                            }
+                                        }
+                                        
+                                        await message.reply(`📊 Game Feed Distance: ${gameFeedDistance}`);
+                                    }
+                                }
+                            } catch (gameFeedError) {
+                                await message.reply(`❌ Game feed error: ${gameFeedError.message}`);
+                            }
+                            
+                            await message.reply(`---`);
+                        }
+                    } else {
+                        await message.reply(`❌ No home run games found for ${playerData.name} this season`);
+                    }
+                }
+            } catch (error) {
+                await message.reply(`❌ Error: ${error.message}`);
+            }
+            
+        } catch (error) {
+            this.log(`Error in test distance data: ${error.message}`);
+            await message.reply('Error testing distance data!');
+        }
+    }
+
     async sendPlayerStats(playerId, message) {
         try {
             const stats = await this.getPlayerStats(playerId);
@@ -734,7 +945,7 @@ class BaseballBot {
             .addFields(
                 { name: 'Player Commands', value: '!judge, !jazz, !soto, !ohtani, !schwarber, !acuna, !alonso, !harper', inline: false },
                 { name: 'General Commands', value: '!hrstats, !testhr, !players', inline: false },
-                { name: 'Debug Commands', value: '!debug, !forcecheck, !reset [player], !testdetails [player], !testrbi [player]', inline: false },
+                { name: 'Debug Commands', value: '!debug, !forcecheck, !reset [player], !testdetails [player], !testrbi [player], !testdistance [player]', inline: false },
                 { name: 'Alert Channels', value: `Sending to ${this.channelIds.length} channel(s)`, inline: false }
             )
             .setColor('#132448')
