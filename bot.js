@@ -214,40 +214,46 @@ class BaseballBot {
                 `https://statsapi.mlb.com/api/v1/people/${playerId}/stats?stats=gameLog&season=${this.currentSeason}&group=hitting&gameType=R`
             );
             
-            if (response.data.stats && response.data.stats[0] && response.data.stats[0].splits) {
-                // Look for the most recent game with home runs
-                const recentGames = response.data.stats[0].splits
-                    .filter(game => game.stat.homeRuns > 0)
-                    .sort((a, b) => new Date(b.date) - new Date(a.date));
-                
-                if (recentGames.length > 0) {
-                    const mostRecentHRGame = recentGames[0];
-                    const rbi = mostRecentHRGame.stat.rbi || 1;
+                            if (response.data.stats && response.data.stats[0] && response.data.stats[0].splits) {
+                    // Look for the most recent game with home runs
+                    const recentGames = response.data.stats[0].splits
+                        .filter(game => game.stat.homeRuns > 0)
+                        .sort((a, b) => new Date(b.date) - new Date(a.date));
                     
-                    // Try to get more accurate RBI data by checking if this was a multi-RBI game
-                    // If the player hit multiple home runs in one game, we need to be more careful
-                    if (mostRecentHRGame.stat.homeRuns > 1) {
-                        // Multiple HRs in one game - assume solo HRs unless we have better data
-                        return {
-                            distance: "Distance not available", // This endpoint doesn't provide distance
-                            rbi: mostRecentHRGame.stat.homeRuns, // Each HR is at least 1 RBI
-                            rbiDescription: this.getRbiDescription(mostRecentHRGame.stat.homeRuns),
-                            gameId: mostRecentHRGame.gameId
-                        };
-                    } else {
-                                            // Single HR - use the game's total RBI as a proxy
-                    // Try to get distance from Statcast API
-                    const distance = await this.getDistanceFromStatcastAPI(playerId, mostRecentHRGame.gameId);
-                    
-                    return {
-                        distance: distance,
-                        rbi: rbi,
-                        rbiDescription: this.getRbiDescription(rbi),
-                        gameId: mostRecentHRGame.gameId
-                    };
+                    if (recentGames.length > 0) {
+                        const mostRecentHRGame = recentGames[0];
+                        const rbi = mostRecentHRGame.stat.rbi || 1;
+                        
+                        // Try to get game ID from multiple possible locations
+                        const gameId = mostRecentHRGame.gameId || mostRecentHRGame.game?.gameId || mostRecentHRGame.gamePk;
+                        
+                        // Try to get more accurate RBI data by checking if this was a multi-RBI game
+                        // If the player hit multiple home runs in one game, we need to be more careful
+                        if (mostRecentHRGame.stat.homeRuns > 1) {
+                            // Multiple HRs in one game - assume solo HRs unless we have better data
+                            return {
+                                distance: "Distance not available", // This endpoint doesn't provide distance
+                                rbi: mostRecentHRGame.stat.homeRuns, // Each HR is at least 1 RBI
+                                rbiDescription: this.getRbiDescription(mostRecentHRGame.stat.homeRuns),
+                                gameId: gameId
+                            };
+                        } else {
+                            // Single HR - use the game's total RBI as a proxy
+                            // Try to get distance from Statcast API if we have a game ID
+                            let distance = "Distance not available";
+                            if (gameId) {
+                                distance = await this.getDistanceFromStatcastAPI(playerId, gameId);
+                            }
+                            
+                            return {
+                                distance: distance,
+                                rbi: rbi,
+                                rbiDescription: this.getRbiDescription(rbi),
+                                gameId: gameId
+                            };
+                        }
                     }
                 }
-            }
             
             return { distance: "Distance not available", rbi: 1, rbiDescription: "Solo HR" };
         } catch (error) {
@@ -671,16 +677,24 @@ class BaseballBot {
                     if (gamesWithHR.length > 0) {
                         const mostRecent = gamesWithHR[0];
                         await message.reply(`📊 Most recent HR game: ${mostRecent.date}`);
-                        await message.reply(`Game ID: ${mostRecent.gameId}`);
+                        await message.reply(`Game ID: ${mostRecent.gameId || 'Not available'}`);
                         await message.reply(`Home Runs: ${mostRecent.stat.homeRuns}`);
                         await message.reply(`RBI: ${mostRecent.stat.rbi}`);
                         
+                        // Debug the game object structure
+                        await message.reply(`🔍 Game object keys: ${Object.keys(mostRecent).join(', ')}`);
+                        if (mostRecent.game) {
+                            await message.reply(`📊 Game sub-object keys: ${Object.keys(mostRecent.game).join(', ')}`);
+                        }
+                        
                         // Try to get detailed game data for this specific game
-                        await message.reply(`🔍 Attempting to get detailed game data for ${mostRecent.gameId}...`);
-                        try {
-                            const gameDetailResponse = await axios.get(
-                                `https://statsapi.mlb.com/api/v1/game/${mostRecent.gameId}/feed/live`
-                            );
+                        const gameId = mostRecent.gameId || mostRecent.game?.gameId;
+                        if (gameId) {
+                            await message.reply(`🔍 Attempting to get detailed game data for ${gameId}...`);
+                            try {
+                                const gameDetailResponse = await axios.get(
+                                    `https://statsapi.mlb.com/api/v1/game/${gameId}/feed/live`
+                                );
                             
                             if (gameDetailResponse.data.liveData && gameDetailResponse.data.liveData.plays) {
                                 const allPlays = gameDetailResponse.data.liveData.plays.allPlays;
@@ -720,7 +734,10 @@ class BaseballBot {
                         } catch (gameDetailError) {
                             await message.reply(`❌ Error fetching game details: ${gameDetailError.message}`);
                         }
+                    } else {
+                        await message.reply(`❌ No valid game ID found for detailed data`);
                     }
+                }
                 }
             } catch (altError) {
                 await message.reply(`❌ Error with alternative API: ${altError.message}`);
