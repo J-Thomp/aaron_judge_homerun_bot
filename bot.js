@@ -212,12 +212,27 @@ class BaseballBot {
                 
                 if (recentGames.length > 0) {
                     const mostRecentHRGame = recentGames[0];
-                    return {
-                        distance: "Distance not available", // This endpoint doesn't provide distance
-                        rbi: mostRecentHRGame.stat.rbi || 1,
-                        rbiDescription: this.getRbiDescription(mostRecentHRGame.stat.rbi || 1),
-                        gameId: mostRecentHRGame.gameId
-                    };
+                    const rbi = mostRecentHRGame.stat.rbi || 1;
+                    
+                    // Try to get more accurate RBI data by checking if this was a multi-RBI game
+                    // If the player hit multiple home runs in one game, we need to be more careful
+                    if (mostRecentHRGame.stat.homeRuns > 1) {
+                        // Multiple HRs in one game - assume solo HRs unless we have better data
+                        return {
+                            distance: "Distance not available", // This endpoint doesn't provide distance
+                            rbi: mostRecentHRGame.stat.homeRuns, // Each HR is at least 1 RBI
+                            rbiDescription: this.getRbiDescription(mostRecentHRGame.stat.homeRuns),
+                            gameId: mostRecentHRGame.gameId
+                        };
+                    } else {
+                        // Single HR - use the game's total RBI as a proxy
+                        return {
+                            distance: "Distance not available", // This endpoint doesn't provide distance
+                            rbi: rbi,
+                            rbiDescription: this.getRbiDescription(rbi),
+                            gameId: mostRecentHRGame.gameId
+                        };
+                    }
                 }
             }
             
@@ -418,6 +433,12 @@ class BaseballBot {
             const playerName = content.split(' ')[1];
             await this.testHomeRunDetails(playerName, message);
         }
+        
+        // Test RBI detection specifically
+        if (content.startsWith('!testrbi ')) {
+            const playerName = content.split(' ')[1];
+            await this.testRBIDetection(playerName, message);
+        }
     }
 
     async sendDebugInfo(message) {
@@ -482,19 +503,178 @@ class BaseballBot {
             }
             
             const playerData = this.players[playerId];
-            await message.reply(`Testing home run details fetching for ${playerData.name}...`);
+            await message.reply(`🔍 Testing home run details fetching for ${playerData.name}...`);
             
-            // Test primary method
+            // Test primary method with detailed debugging
+            await message.reply(`📊 Testing primary method (game feed API)...`);
             const primaryDetails = await this.getRecentHomeRunDetails(playerId);
             await message.reply(`Primary method results for ${playerData.name}:\nDistance: ${primaryDetails.distance}\nRBI: ${primaryDetails.rbi}\nType: ${primaryDetails.rbiDescription}`);
             
             // Test alternative method
+            await message.reply(`📊 Testing alternative method (game log API)...`);
             const alternativeDetails = await this.getHomeRunDetailsFromAlternativeAPI(playerId);
             await message.reply(`Alternative method results for ${playerData.name}:\nDistance: ${alternativeDetails.distance}\nRBI: ${alternativeDetails.rbi}\nType: ${alternativeDetails.rbiDescription}`);
+            
+            // Test current season stats to see if player has any home runs
+            await message.reply(`📊 Checking current season stats...`);
+            const currentHR = await this.getPlayerHomeRuns(playerId);
+            await message.reply(`Current season home runs for ${playerData.name}: ${currentHR}`);
+            
+            // Test raw API response for debugging
+            await this.testRawAPIResponse(playerId, message);
             
         } catch (error) {
             this.log(`Error in test details command: ${error.message}`);
             await message.reply('Error testing home run details!');
+        }
+    }
+
+    async testRawAPIResponse(playerId, message) {
+        try {
+            const playerData = this.players[playerId];
+            await message.reply(`🔍 Testing raw API responses for ${playerData.name}...`);
+            
+            // Test game log API
+            try {
+                const gamesResponse = await axios.get(
+                    `https://statsapi.mlb.com/api/v1/people/${playerId}/gameLog?season=${this.currentSeason}&gameType=R&limit=5`
+                );
+                
+                if (gamesResponse.data.dates && gamesResponse.data.dates.length > 0) {
+                    const recentGames = gamesResponse.data.dates.slice(0, 2); // Just check first 2 dates
+                    await message.reply(`📊 Found ${recentGames.length} recent game dates for ${playerData.name}`);
+                    
+                    for (let i = 0; i < recentGames.length; i++) {
+                        const date = recentGames[i];
+                        await message.reply(`📅 Date ${i+1}: ${date.date} - ${date.games.length} games`);
+                        
+                        if (date.games.length > 0) {
+                            const game = date.games[0]; // Check first game of each date
+                            await message.reply(`🎮 Game ID: ${game.gameId}, Home: ${game.teams.home.team.name}, Away: ${game.teams.away.team.name}`);
+                            
+                            // Try to get game feed data
+                            try {
+                                const gameFeedResponse = await axios.get(
+                                    `https://statsapi.mlb.com/api/v1/game/${game.gameId}/feed/live`
+                                );
+                                
+                                if (gameFeedResponse.data.liveData && gameFeedResponse.data.liveData.plays) {
+                                    const allPlays = gameFeedResponse.data.liveData.plays.allPlays;
+                                    await message.reply(`📋 Game has ${allPlays.length} total plays`);
+                                    
+                                    // Look for any home runs in this game
+                                    const homeRunPlays = allPlays.filter(play => 
+                                        play.result && 
+                                        (play.result.event === 'Home Run' || 
+                                         play.result.eventType === 'home_run' ||
+                                         (play.result.description && play.result.description.toLowerCase().includes('home run')))
+                                    );
+                                    
+                                    await message.reply(`⚾ Found ${homeRunPlays.length} home run plays in this game`);
+                                    
+                                    if (homeRunPlays.length > 0) {
+                                        const samplePlay = homeRunPlays[0];
+                                        await message.reply(`📊 Sample home run play structure:`);
+                                        await message.reply(`Event: ${samplePlay.result?.event || 'N/A'}`);
+                                        await message.reply(`EventType: ${samplePlay.result?.eventType || 'N/A'}`);
+                                        await message.reply(`Description: ${samplePlay.result?.description || 'N/A'}`);
+                                        await message.reply(`RBI: ${samplePlay.result?.rbi || 'N/A'}`);
+                                        
+                                        if (samplePlay.hitData) {
+                                            await message.reply(`HitData keys: ${Object.keys(samplePlay.hitData).join(', ')}`);
+                                            if (samplePlay.hitData.totalDistance) {
+                                                await message.reply(`TotalDistance: ${samplePlay.hitData.totalDistance}`);
+                                            }
+                                            if (samplePlay.hitData.distance) {
+                                                await message.reply(`Distance: ${samplePlay.hitData.distance}`);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    await message.reply(`❌ No live data available for this game`);
+                                }
+                            } catch (gameFeedError) {
+                                await message.reply(`❌ Error fetching game feed: ${gameFeedError.message}`);
+                            }
+                        }
+                    }
+                } else {
+                    await message.reply(`❌ No recent games found for ${playerData.name}`);
+                }
+            } catch (gamesError) {
+                await message.reply(`❌ Error fetching game log: ${gamesError.message}`);
+            }
+            
+        } catch (error) {
+            this.log(`Error in test raw API response: ${error.message}`);
+            await message.reply('Error testing raw API response!');
+        }
+    }
+
+    async testRBIDetection(playerName, message) {
+        try {
+            const playerId = Object.keys(this.players).find(id => 
+                this.players[id].name.toLowerCase().includes(playerName.toLowerCase())
+            );
+            
+            if (!playerId) {
+                await message.reply(`Player "${playerName}" not found!`);
+                return;
+            }
+            
+            const playerData = this.players[playerId];
+            await message.reply(`🔍 Testing RBI detection for ${playerData.name}...`);
+            
+            // Get current season stats first
+            const stats = await this.getPlayerStats(playerId);
+            if (stats) {
+                await message.reply(`📊 ${playerData.name} season stats:\nHR: ${stats.homeRuns || 0}\nRBI: ${stats.rbi || 0}\nAVG: ${stats.avg || 'N/A'}`);
+            }
+            
+            // Try to get recent game-by-game RBI data
+            try {
+                const response = await axios.get(
+                    `https://statsapi.mlb.com/api/v1/people/${playerId}/stats?stats=gameLog&season=${this.currentSeason}&group=hitting&gameType=R`
+                );
+                
+                if (response.data.stats && response.data.stats[0] && response.data.stats[0].splits) {
+                    const games = response.data.stats[0].splits
+                        .filter(game => game.stat.homeRuns > 0) // Only games with home runs
+                        .sort((a, b) => new Date(b.date) - new Date(a.date))
+                        .slice(0, 5); // Last 5 games with HRs
+                    
+                    if (games.length > 0) {
+                        await message.reply(`⚾ Found ${games.length} recent games with home runs:`);
+                        
+                        for (const game of games) {
+                            const rbi = game.stat.rbi || 0;
+                            const hr = game.stat.homeRuns || 0;
+                            const rbiDescription = this.getRbiDescription(rbi);
+                            
+                            await message.reply(`📅 ${game.date}: ${hr} HR, ${rbi} RBI (${rbiDescription})`);
+                        }
+                        
+                        // Test the most recent home run game
+                        const mostRecent = games[0];
+                        await message.reply(`🔍 Testing most recent HR game (${mostRecent.date}):`);
+                        await message.reply(`Game ID: ${mostRecent.gameId}`);
+                        await message.reply(`Home Runs: ${mostRecent.stat.homeRuns}`);
+                        await message.reply(`RBI: ${mostRecent.stat.rbi}`);
+                        await message.reply(`RBI Description: ${this.getRbiDescription(mostRecent.stat.rbi)}`);
+                        
+                    } else {
+                        await message.reply(`❌ No games with home runs found for ${playerData.name} this season`);
+                    }
+                } else {
+                    await message.reply(`❌ No game log data available for ${playerData.name}`);
+                }
+            } catch (error) {
+                await message.reply(`❌ Error fetching game log: ${error.message}`);
+            }
+            
+        } catch (error) {
+            this.log(`Error in test RBI detection: ${error.message}`);
+            await message.reply('Error testing RBI detection!');
         }
     }
 
@@ -554,7 +734,7 @@ class BaseballBot {
             .addFields(
                 { name: 'Player Commands', value: '!judge, !jazz, !soto, !ohtani, !schwarber, !acuna, !alonso, !harper', inline: false },
                 { name: 'General Commands', value: '!hrstats, !testhr, !players', inline: false },
-                { name: 'Debug Commands', value: '!debug, !forcecheck, !reset [player], !testdetails [player]', inline: false },
+                { name: 'Debug Commands', value: '!debug, !forcecheck, !reset [player], !testdetails [player], !testrbi [player]', inline: false },
                 { name: 'Alert Channels', value: `Sending to ${this.channelIds.length} channel(s)`, inline: false }
             )
             .setColor('#132448')
