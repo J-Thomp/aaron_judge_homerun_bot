@@ -504,19 +504,35 @@ class BaseballBot {
     async sendHomeRunAlert(playerData, totalHomeRuns, newCount, details) {
         this.log(`Sending home run alert for ${playerData.name} to ${this.channelIds.length} channel(s)...`);
         
-        // details is now an array
-        const isMultiple = Array.isArray(details) && details.length > 1;
         const primaryDetails = Array.isArray(details) ? details[0] : details;
+        
+        // Parse distance for nuke check
+        let isNuke = false;
+        if (primaryDetails.distance && primaryDetails.distance !== "Not yet available" && primaryDetails.distance !== "Distance not available") {
+            const match = primaryDetails.distance.match(/(\d+)/);
+            if (match) {
+                const distanceNum = parseInt(match[1]);
+                isNuke = distanceNum >= 435;
+            }
+        }
         
         const hrType = primaryDetails.rbiDescription || 'Solo HR';
         const titleText = hrType === 'Grand Slam!' ? 
-            `⚾ ${playerData.name.toUpperCase()} GRAND SLAM! ⚾` :
-            `⚾ ${playerData.name.toUpperCase()} ${hrType.toUpperCase().replace(' HR', ' HOME RUN')}! ⚾`;
+            `${playerData.name.toUpperCase()} GRAND SLAM!` :
+            `${playerData.name.toUpperCase()} ${hrType.toUpperCase().replace(' HR', ' HOME RUN')}!`;
+        
+        // Always use singular description
+        let description = `${playerData.name} just hit a home run!`;
+        if (isNuke) {
+            description = `${playerData.name} just hit a fucking NUKE!`;
+        }
         
         const embed = new Discord.EmbedBuilder()
             .setTitle(titleText)
-            .setDescription(`${playerData.name} just hit ${newCount > 1 ? newCount + ' home runs' : 'a home run'}!`)
+            .setDescription(description)
             .addFields(
+                { name: 'Type', value: hrType, inline: true },
+                { name: 'Distance', value: primaryDetails.distance, inline: true },
                 { name: 'Player', value: `${playerData.name} (#${playerData.number})`, inline: true },
                 { name: 'Team', value: playerData.team, inline: true },
                 { name: 'Season Total', value: `${totalHomeRuns} HR`, inline: true }
@@ -524,21 +540,8 @@ class BaseballBot {
             .setColor('#132448')
             .setTimestamp();
 
-        // Add details for each HR
-        if (Array.isArray(details)) {
-            details.forEach((det, index) => {
-                const detText = `Type: ${det.rbiDescription}\nDistance: ${det.distance}`;
-                embed.addFields({ 
-                    name: `HR #${index + 1}`, 
-                    value: detText, 
-                    inline: true 
-                });
-            });
-        } else {
-            embed.addFields({ name: 'Distance', value: primaryDetails.distance, inline: true });
-        }
-
-        if (details.some(d => d.rbi === 'unknown')) {
+        // Set footer if details pending
+        if (primaryDetails.rbi === 'unknown') {
             embed.setFooter({ text: 'Details may update soon—check back!' });
         }
 
@@ -1435,20 +1438,32 @@ class BaseballBot {
             // Create the embed for test (same as sendHomeRunAlert but only send to current channel)
             const hrType = testDetails.rbiDescription || 'Solo HR';
             const titleText = hrType === 'Grand Slam!' ? 
-                `⚾ ${playerData.name.toUpperCase()} GRAND SLAM! ⚾` :
-                `⚾ ${playerData.name.toUpperCase()} ${hrType.toUpperCase().replace(' HR', ' HOME RUN')}! ⚾`;
+                `${playerData.name.toUpperCase()} GRAND SLAM!` :
+                `${playerData.name.toUpperCase()} ${hrType.toUpperCase().replace(' HR', ' HOME RUN')}!`;
+            
+            // Always use singular description
+            let description = `${playerData.name} just hit a home run!`;
+            if (isNuke) {
+                description = `${playerData.name} just hit a fucking NUKE!`;
+            }
             
             const embed = new Discord.EmbedBuilder()
                 .setTitle(titleText)
-                .setDescription(`${playerData.name} just hit a home run! (TEST ALERT)`)
+                .setDescription(description)
                 .addFields(
+                    { name: 'Type', value: hrType, inline: true },
+                    { name: 'Distance', value: testDetails.distance, inline: true },
                     { name: 'Player', value: `${playerData.name} (#${playerData.number})`, inline: true },
                     { name: 'Team', value: playerData.team, inline: true },
-                    { name: 'Season Total', value: `${Math.floor(Math.random() * 40) + 10} HR`, inline: true },
-                    { name: 'Distance', value: testDetails.distance, inline: true }
+                    { name: 'Season Total', value: `${Math.floor(Math.random() * 40) + 10} HR`, inline: true }
                 )
                 .setColor('#132448')
                 .setTimestamp();
+
+            // Set footer if details pending
+            if (testDetails.rbi === 'unknown') {
+                embed.setFooter({ text: 'Details may update soon—check back!' });
+            }
 
             // Set player headshot using MLB's official headshot URLs
             const headshots = {
