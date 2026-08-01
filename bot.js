@@ -1,62 +1,766 @@
-require('dotenv').config();
 const Discord = require('discord.js');
-const axios = require('axios');
-const cron = require('node-cron');
 const { execFile } = require('child_process');
 const { parse } = require('csv-parse/sync');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
+const crypto = require('crypto');
+const { loadEnvironmentFile } = require('./scripts/environment');
+
+const STATE_VERSION = 3;
+const DEFAULT_HTTP_TIMEOUT_MS = 10000;
+const DEFAULT_HTTP_RETRIES = 3;
+const DEFAULT_ENRICHMENT_CONCURRENCY = 3;
+const DEFAULT_ANALYSIS_CONCURRENCY = 2;
+const DEFAULT_BACKFILL_LIMIT = 3;
+const DEFAULT_BACKFILL_COOLDOWN_MS = 60000;
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 15000;
+const DEFAULT_READY_TIMEOUT_MS = 60000;
+const DEFAULT_ENRICHMENT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_ENRICHMENT_MAX_DATA_ATTEMPTS = 96;
+const DEFAULT_AUTHORITATIVE_RECONCILIATION_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+function parseCsvIds(value, label, { required = false } = {}) {
+    const ids = [...new Set(String(value || '')
+        .split(',')
+        .map(id => id.trim())
+        .filter(Boolean))];
+
+    if (required && ids.length === 0) {
+        throw new Error(`${label} must contain at least one Discord ID`);
+    }
+
+    const invalidIds = ids.filter(id => !/^\d{17,20}$/.test(id));
+    if (invalidIds.length > 0) {
+        throw new Error(`${label} contains invalid Discord ID values`);
+    }
+
+    return ids;
+}
+
+function parsePositiveInteger(
+    value,
+    fallback,
+    minimum = 1,
+    maximum = Number.MAX_SAFE_INTEGER,
+    label = 'configuration value'
+) {
+    if (value === undefined || value === null || String(value).trim() === '') {
+        return fallback;
+    }
+    const parsed = Number.parseInt(value, 10);
+    if (!/^-?\d+$/.test(String(value).trim()) ||
+        !Number.isInteger(parsed) ||
+        parsed < minimum ||
+        parsed > maximum) {
+        throw new Error(`${label} must be an integer between ${minimum} and ${maximum}`);
+    }
+    return parsed;
+}
+
+function resolveStatePath(value, baseDirectory = process.cwd()) {
+    const configuredValue = String(value || '').trim();
+    if (configuredValue.includes('\0')) {
+        throw new Error('STATE_PATH contains a null byte');
+    }
+    if (configuredValue && /[\\/]$/.test(configuredValue)) {
+        throw new Error('STATE_PATH must name a file, not a directory');
+    }
+    const resolvedPath = configuredValue
+        ? path.resolve(baseDirectory, configuredValue)
+        : path.resolve(__dirname, 'data', 'bot_state.json');
+    const parsedPath = path.parse(resolvedPath);
+    if (!parsedPath.base || parsedPath.root === resolvedPath) {
+        throw new Error('STATE_PATH must resolve to an explicit file path');
+    }
+    try {
+        if (fs.existsSync(resolvedPath) && fs.statSync(resolvedPath).isDirectory()) {
+            throw new Error('STATE_PATH points to a directory');
+        }
+    } catch (error) {
+        if (error.message === 'STATE_PATH points to a directory') throw error;
+        throw new Error(`STATE_PATH cannot be inspected: ${error.message}`);
+    }
+    return resolvedPath;
+}
+
+function parseConfig(env = process.env, options = {}) {
+    const token = String(env.BOT_TOKEN || '').trim();
+    if (!token) {
+        throw new Error('BOT_TOKEN is required');
+    }
+    const backfillBatchSize = parsePositiveInteger(
+        env.BACKFILL_BATCH_SIZE ?? env.BACKFILL_LIMIT,
+        DEFAULT_BACKFILL_LIMIT,
+        1,
+        25,
+        env.BACKFILL_BATCH_SIZE !== undefined ? 'BACKFILL_BATCH_SIZE' : 'BACKFILL_LIMIT'
+    );
+
+    return {
+        token,
+        channelIds: parseCsvIds(env.CHANNEL_ID, 'CHANNEL_ID', { required: true }),
+        adminUserIds: parseCsvIds(env.ADMIN_USER_IDS, 'ADMIN_USER_IDS'),
+        allowedGuildIds: parseCsvIds(env.ALLOWED_GUILD_IDS, 'ALLOWED_GUILD_IDS'),
+        botUsername: String(env.BOT_USERNAME || '').trim() || null,
+        pythonPath: String(env.PYTHON_BIN || env.PYTHON_PATH || '').trim() || null,
+        statePath: resolveStatePath(env.STATE_PATH, options.cwd || process.cwd()),
+        httpTimeoutMs: parsePositiveInteger(
+            env.HTTP_TIMEOUT_MS,
+            DEFAULT_HTTP_TIMEOUT_MS,
+            1000,
+            120000,
+            'HTTP_TIMEOUT_MS'
+        ),
+        httpRetries: parsePositiveInteger(env.HTTP_RETRIES, DEFAULT_HTTP_RETRIES, 0, 10, 'HTTP_RETRIES'),
+        enrichmentConcurrency: parsePositiveInteger(
+            env.ENRICHMENT_CONCURRENCY,
+            DEFAULT_ENRICHMENT_CONCURRENCY,
+            1,
+            20,
+            'ENRICHMENT_CONCURRENCY'
+        ),
+        analysisConcurrency: parsePositiveInteger(
+            env.ANALYSIS_CONCURRENCY,
+            DEFAULT_ANALYSIS_CONCURRENCY,
+            1,
+            8,
+            'ANALYSIS_CONCURRENCY'
+        ),
+        backfillBatchSize,
+        // Compatibility for callers using the pre-rename option. New deployments should use
+        // BACKFILL_BATCH_SIZE because this limits work per job, not concurrent jobs.
+        backfillLimit: backfillBatchSize,
+        backfillCooldownMs: parsePositiveInteger(
+            env.BACKFILL_COOLDOWN_MS,
+            DEFAULT_BACKFILL_COOLDOWN_MS,
+            1000,
+            3600000,
+            'BACKFILL_COOLDOWN_MS'
+        ),
+        pollIntervalMs: parsePositiveInteger(
+            env.POLL_INTERVAL_MS,
+            240000,
+            30000,
+            3600000,
+            'POLL_INTERVAL_MS'
+        ),
+        offseasonPollIntervalMs: parsePositiveInteger(
+            env.OFFSEASON_POLL_INTERVAL_MS,
+            6 * 60 * 60 * 1000,
+            60000,
+            24 * 60 * 60 * 1000,
+            'OFFSEASON_POLL_INTERVAL_MS'
+        ),
+        pollJitterMs: parsePositiveInteger(env.POLL_JITTER_MS, 30000, 0, 300000, 'POLL_JITTER_MS'),
+        readyTimeoutMs: parsePositiveInteger(
+            env.READY_TIMEOUT_MS,
+            DEFAULT_READY_TIMEOUT_MS,
+            1000,
+            300000,
+            'READY_TIMEOUT_MS'
+        )
+    };
+}
+
+function defaultSleep(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function safeDateTimestamp(value) {
+    const timestamp = value ? Date.parse(value) : Number.NaN;
+    return Number.isFinite(timestamp) ? timestamp : Number.MAX_SAFE_INTEGER;
+}
+
+function validateStateDocument(value) {
+    const isRecord = candidate =>
+        Boolean(candidate) && typeof candidate === 'object' && !Array.isArray(candidate);
+    const validateIdArray = (candidate, label) => {
+        if (!Array.isArray(candidate) ||
+            candidate.some(item =>
+                typeof item !== 'string' ||
+                !item.trim() ||
+                item.length > 512
+            )) {
+            throw new Error(`${label} must be an array of non-empty IDs`);
+        }
+    };
+    const validateRecordValues = (candidate, label, predicate = isRecord) => {
+        if (!isRecord(candidate) ||
+            Object.entries(candidate).some(([key, item]) =>
+                !key.trim() || !predicate(item)
+            )) {
+            throw new Error(`${label} is invalid`);
+        }
+    };
+    const validateOptionalString = (candidate, label, { nullable = true } = {}) => {
+        if (candidate === undefined || (nullable && candidate === null)) return;
+        if (typeof candidate !== 'string' || !candidate.trim()) {
+            throw new Error(`${label} must be a non-empty string`);
+        }
+    };
+    const validateOptionalTimestamp = (candidate, label) => {
+        if (candidate === undefined || candidate === null) return;
+        if (typeof candidate !== 'string' || !Number.isFinite(Date.parse(candidate))) {
+            throw new Error(`${label} must be a valid timestamp`);
+        }
+    };
+
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('state root must be an object');
+    }
+    if (!Number.isInteger(Number(value.season)) || Number(value.season) < 2000) {
+        throw new Error('state season is invalid');
+    }
+    if (value.version !== undefined &&
+        (!Number.isInteger(value.version) || value.version < 1 || value.version > STATE_VERSION)) {
+        throw new Error(
+            `state version ${String(value.version)} is unsupported; this bot supports legacy unversioned state through version ${STATE_VERSION}`
+        );
+    }
+    if (!value.players || typeof value.players !== 'object' || Array.isArray(value.players)) {
+        throw new Error('state players object is missing');
+    }
+    validateOptionalTimestamp(value.updatedAt, 'state updatedAt');
+    for (const [playerId, playerState] of Object.entries(value.players)) {
+        if (!playerId.trim() || !isRecord(playerState)) {
+            throw new Error(`state player ${playerId} must be an object`);
+        }
+        const checkpoint = playerState.lastCheckedHR;
+        if (!Number.isInteger(checkpoint) || checkpoint < 0 || checkpoint > 1000) {
+            throw new Error(`state player ${playerId} has an invalid checkpoint`);
+        }
+        if (Number(value.version || 0) >= 3 &&
+            typeof playerState.checkpointInitialized !== 'boolean') {
+            throw new Error(`state player ${playerId} is missing its checkpoint flag`);
+        }
+        if (playerState.checkpointInitialized !== undefined &&
+            typeof playerState.checkpointInitialized !== 'boolean') {
+            throw new Error(`state player ${playerId} has an invalid checkpoint flag`);
+        }
+        for (const field of [
+            'sentHomeRuns',
+            'baselineHomeRunIds',
+            'authoritativeHomeRunIds',
+        ]) {
+            if (playerState[field] !== undefined) {
+                validateIdArray(playerState[field], `state player ${playerId} ${field}`);
+            }
+        }
+        for (const field of [
+            'eventAliases',
+            'homeRunEvents',
+            'homeRunParks',
+            'sentHomeRunsByChannel',
+            'alertMessagesByChannel',
+        ]) {
+            if (playerState[field] !== undefined && !isRecord(playerState[field])) {
+                throw new Error(`state player ${playerId} ${field} must be an object`);
+            }
+        }
+        if (playerState.eventAliases !== undefined) {
+            validateRecordValues(
+                playerState.eventAliases,
+                `state player ${playerId} eventAliases`,
+                item => typeof item === 'string' && Boolean(item.trim())
+            );
+        }
+        if (playerState.homeRunEvents !== undefined) {
+            validateRecordValues(
+                playerState.homeRunEvents,
+                `state player ${playerId} homeRunEvents`
+            );
+        }
+        if (playerState.homeRunParks !== undefined) {
+            validateRecordValues(
+                playerState.homeRunParks,
+                `state player ${playerId} homeRunParks`,
+                item => isRecord(item) ||
+                    ((typeof item === 'number' || typeof item === 'string') &&
+                        String(item).trim() &&
+                        Number.isFinite(Number(item)))
+            );
+        }
+        for (const [channelId, ids] of Object.entries(
+            playerState.sentHomeRunsByChannel || {}
+        )) {
+            if (!channelId.trim()) {
+                throw new Error(`state player ${playerId} has an empty channel ID`);
+            }
+            validateIdArray(ids, `state player ${playerId} channel ${channelId}`);
+        }
+        for (const [channelId, records] of Object.entries(
+            playerState.alertMessagesByChannel || {}
+        )) {
+            if (!isRecord(records) ||
+                Object.values(records).some(record => !isRecord(record))) {
+                throw new Error(
+                    `state player ${playerId} channel ${channelId} alert records are invalid`
+                );
+            }
+            for (const [eventId, record] of Object.entries(records)) {
+                if (!eventId.trim()) {
+                    throw new Error(
+                        `state player ${playerId} channel ${channelId} has an empty event ID`
+                    );
+                }
+                for (const field of [
+                    'messageId',
+                    'deliveryMode',
+                    'playerId',
+                    'hrId',
+                    'enrichmentDeliveryMode',
+                    'enrichmentMessageId',
+                    'correctionMessageId',
+                    'enrichmentFailureReason',
+                    'analysisSourceDataHash',
+                    'analysisMetadataVersion',
+                ]) {
+                    validateOptionalString(
+                        record[field],
+                        `state alert ${channelId}/${eventId} ${field}`
+                    );
+                }
+                for (const field of [
+                    'basicSentAt',
+                    'enrichedAt',
+                    'retractedAt',
+                    'enrichmentFailedAt',
+                    'parkAnalysisWithdrawnAt',
+                ]) {
+                    validateOptionalTimestamp(
+                        record[field],
+                        `state alert ${channelId}/${eventId} ${field}`
+                    );
+                }
+                if (record.hrDetail !== undefined && !isRecord(record.hrDetail)) {
+                    throw new Error(
+                        `state alert ${channelId}/${eventId} hrDetail is invalid`
+                    );
+                }
+                for (const field of [
+                    'imageDelivered',
+                    'parkAnalysisDelivered',
+                ]) {
+                    if (record[field] !== undefined &&
+                        typeof record[field] !== 'boolean') {
+                        throw new Error(
+                            `state alert ${channelId}/${eventId} ${field} must be boolean`
+                        );
+                    }
+                }
+            }
+        }
+        for (const field of [
+            'baselineSnapshotInitialized',
+            'authoritativeSnapshotInitialized',
+        ]) {
+            if (playerState[field] !== undefined &&
+                typeof playerState[field] !== 'boolean') {
+                throw new Error(`state player ${playerId} ${field} must be boolean`);
+            }
+        }
+        if (Number(value.version || 0) >= 3) {
+            for (const field of [
+                'baselineSnapshotInitialized',
+                'authoritativeSnapshotInitialized',
+            ]) {
+                if (typeof playerState[field] !== 'boolean') {
+                    throw new Error(`state player ${playerId} is missing ${field}`);
+                }
+            }
+            for (const field of [
+                'sentHomeRuns',
+                'baselineHomeRunIds',
+                'authoritativeHomeRunIds',
+            ]) {
+                if (!Array.isArray(playerState[field])) {
+                    throw new Error(`state player ${playerId} is missing ${field}`);
+                }
+            }
+            const acknowledgedIds = new Set([
+                ...playerState.baselineHomeRunIds,
+                ...playerState.sentHomeRuns,
+            ]);
+            const authoritativeIds = new Set(
+                playerState.authoritativeHomeRunIds
+            );
+            if (playerState.checkpointInitialized &&
+                playerState.baselineSnapshotInitialized &&
+                acknowledgedIds.size < checkpoint) {
+                throw new Error(
+                    `state player ${playerId} baseline inventory does not cover its checkpoint`
+                );
+            }
+            if (playerState.checkpointInitialized &&
+                playerState.authoritativeSnapshotInitialized &&
+                authoritativeIds.size < checkpoint) {
+                throw new Error(
+                    `state player ${playerId} authoritative inventory does not cover its checkpoint`
+                );
+            }
+            if (playerState.baselineSnapshotInitialized &&
+                playerState.authoritativeSnapshotInitialized) {
+                for (const eventId of acknowledgedIds) {
+                    if (!authoritativeIds.has(eventId)) {
+                        throw new Error(
+                            `state player ${playerId} acknowledges an event outside its authoritative inventory`
+                        );
+                    }
+                }
+                for (const eventId of Object.keys(
+                    playerState.homeRunEvents || {}
+                )) {
+                    if (!authoritativeIds.has(eventId)) {
+                        throw new Error(
+                            `state player ${playerId} caches an event outside its authoritative inventory`
+                        );
+                    }
+                }
+                for (const eventId of Object.keys(
+                    playerState.homeRunParks || {}
+                )) {
+                    if (!authoritativeIds.has(eventId)) {
+                        throw new Error(
+                            `state player ${playerId} has park data outside its authoritative inventory`
+                        );
+                    }
+                }
+            }
+            for (const [channelId, eventIds] of Object.entries(
+                playerState.sentHomeRunsByChannel || {}
+            )) {
+                const records =
+                    playerState.alertMessagesByChannel?.[channelId] || {};
+                for (const eventId of eventIds) {
+                    if (playerState.authoritativeSnapshotInitialized &&
+                        !authoritativeIds.has(eventId)) {
+                        throw new Error(
+                            `state player ${playerId} channel ${channelId} acknowledges an event outside its authoritative inventory`
+                        );
+                    }
+                    if (!Number.isFinite(Date.parse(
+                        records[eventId]?.basicSentAt
+                    ))) {
+                        throw new Error(
+                            `state player ${playerId} channel ${channelId} has no durable alert record for ${eventId}`
+                        );
+                    }
+                }
+            }
+        }
+        if (playerState.lowerTotalObservation !== undefined &&
+            playerState.lowerTotalObservation !== null) {
+            const observation = playerState.lowerTotalObservation;
+            if (!isRecord(observation) ||
+                !Number.isInteger(observation.value) ||
+                observation.value < 0 ||
+                !Number.isInteger(observation.count) ||
+                observation.count < 1) {
+                throw new Error(
+                    `state player ${playerId} lower-total observation is invalid`
+                );
+            }
+        }
+        if (playerState.inventoryCorrectionCandidate !== undefined &&
+            playerState.inventoryCorrectionCandidate !== null) {
+            const candidate =
+                playerState.inventoryCorrectionCandidate;
+            if (!isRecord(candidate) ||
+                !/^[a-f0-9]{64}$/.test(String(candidate.digest || '')) ||
+                !Number.isInteger(candidate.authoritativeTotal) ||
+                candidate.authoritativeTotal < 0) {
+                throw new Error(
+                    `state player ${playerId} inventory correction candidate is invalid`
+                );
+            }
+            validateIdArray(
+                candidate.eventIds,
+                `state player ${playerId} inventory correction candidate eventIds`
+            );
+            validateOptionalTimestamp(
+                candidate.observedAt,
+                `state player ${playerId} inventory correction candidate observedAt`
+            );
+            if (!candidate.observedAt) {
+                throw new Error(
+                    `state player ${playerId} inventory correction candidate has no observedAt`
+                );
+            }
+        }
+        if (playerState.lastKnownStats !== undefined &&
+            playerState.lastKnownStats !== null &&
+            (!isRecord(playerState.lastKnownStats) ||
+                !isRecord(playerState.lastKnownStats.stats))) {
+            throw new Error(`state player ${playerId} cached stats are invalid`);
+        }
+        validateOptionalTimestamp(
+            playerState.lastKnownStats?.fetchedAt,
+            `state player ${playerId} cached stats timestamp`
+        );
+        validateOptionalTimestamp(
+            playerState.authoritativeSnapshotCapturedAt,
+            `state player ${playerId} authoritative snapshot timestamp`
+        );
+    }
+    if (Number(value.version || 0) >= 3 &&
+        !isRecord(value.pendingEnrichments)) {
+        throw new Error('state pendingEnrichments is missing');
+    }
+    if (value.pendingEnrichments !== undefined &&
+        (!value.pendingEnrichments || typeof value.pendingEnrichments !== 'object' ||
+            Array.isArray(value.pendingEnrichments))) {
+        throw new Error('state pendingEnrichments must be an object');
+    }
+    for (const [jobKey, record] of Object.entries(value.pendingEnrichments || {})) {
+        if (!isRecord(record) ||
+            !jobKey.trim() ||
+            typeof record.playerId !== 'string' ||
+            !record.playerId.trim() ||
+            !Number.isInteger(record.season) ||
+            typeof record.hrId !== 'string' ||
+            !record.hrId.trim() ||
+            !isRecord(record.hrDetail)) {
+            throw new Error(`state pending enrichment ${jobKey} is invalid`);
+        }
+        const expectedJobKey =
+            `${record.season}:${record.playerId}:${record.hrId}`;
+        if (jobKey !== expectedJobKey) {
+            throw new Error(
+                `state pending enrichment ${jobKey} does not match ${expectedJobKey}`
+            );
+        }
+        validateIdArray(
+            record.channelIds,
+            `state pending enrichment ${jobKey} channelIds`
+        );
+        if (record.previousHrIds !== undefined) {
+            validateIdArray(
+                record.previousHrIds,
+                `state pending enrichment ${jobKey} previousHrIds`
+            );
+        }
+        if (record.channelIds.length === 0 ||
+            !String(record.hrDetail.gameId || '').trim() ||
+            !Number.isInteger(record.hrDetail.gameHomeRunIndex) ||
+            record.hrDetail.gameHomeRunIndex < 1) {
+            throw new Error(`state pending enrichment ${jobKey} lacks event context`);
+        }
+        const playerDocument = value.players[record.playerId];
+        const deliveryIds = [
+            record.hrId,
+            ...(record.previousHrIds || [])
+        ];
+        if (playerDocument?.authoritativeSnapshotInitialized) {
+            const authoritativeIds = new Set(
+                playerDocument.authoritativeHomeRunIds || []
+            );
+            if (!deliveryIds.some(eventId =>
+                authoritativeIds.has(eventId)
+            )) {
+                throw new Error(
+                    `state pending enrichment ${jobKey} is outside the authoritative inventory`
+                );
+            }
+        }
+        if (!playerDocument ||
+                    record.channelIds.some(channelId => {
+                        const channelRecords =
+                            playerDocument.alertMessagesByChannel?.[channelId];
+                        return !deliveryIds.some(eventId =>
+                            Number.isFinite(Date.parse(
+                                channelRecords?.[eventId]?.basicSentAt
+                            )) &&
+                            !channelRecords[eventId].enrichedAt &&
+                            !channelRecords[eventId].retractedAt &&
+                            !channelRecords[eventId].enrichmentFailedAt
+                        );
+                    })) {
+            throw new Error(
+                `state pending enrichment ${jobKey} has no durable basic delivery`
+            );
+        }
+        validateOptionalTimestamp(
+            record.createdAt,
+            `state pending enrichment ${jobKey} createdAt`
+        );
+        if (!record.createdAt) {
+            throw new Error(`state pending enrichment ${jobKey} has no createdAt`);
+        }
+        validateOptionalTimestamp(
+            record.nextAttemptAt,
+            `state pending enrichment ${jobKey} nextAttemptAt`
+        );
+        for (const field of [
+            'attempts',
+            'dataAttempts',
+            'analysisAttempts',
+            'deliveryAttempts',
+            'imageRegenerationAttempts',
+        ]) {
+            if (record[field] !== undefined &&
+                (!Number.isInteger(record[field]) || record[field] < 0)) {
+                throw new Error(
+                    `state pending enrichment ${jobKey} ${field} is invalid`
+                );
+            }
+        }
+    }
+    return value;
+}
 
 class BaseballBot {
     constructor(token, channelIds, options = {}) {
-        this.client = new Discord.Client({
+        this.client = options.client || new Discord.Client({
             intents: [
                 Discord.GatewayIntentBits.Guilds,
                 Discord.GatewayIntentBits.GuildMessages,
                 Discord.GatewayIntentBits.MessageContent
-            ]
+            ],
+            allowedMentions: { parse: [], repliedUser: false }
         });
         this.token = token;
-        this.channelIds = Array.isArray(channelIds) ? channelIds : [channelIds];
-        this.currentSeason = new Date().getFullYear();
-        
+        this.channelIds = [...new Set((Array.isArray(channelIds) ? channelIds : [channelIds])
+            .map(id => String(id || '').trim())
+            .filter(Boolean))];
+        if (this.channelIds.length === 0 || this.channelIds.some(id => !/^\d{17,20}$/.test(id))) {
+            throw new Error('At least one valid Discord channel ID is required');
+        }
+
+        this.clock = options.clock || (() => new Date());
+        this.sleep = options.sleep || defaultSleep;
+        this.random = options.random || Math.random;
+        this.currentSeason = this.clock().getUTCFullYear();
+        this.httpClient = options.httpClient || null;
+        this.fetchImpl = options.fetch || globalThis.fetch;
+        if (!this.httpClient && typeof this.fetchImpl !== 'function') {
+            throw new Error('A Fetch-compatible HTTP implementation is required');
+        }
+        this.httpTimeoutMs = options.httpTimeoutMs || DEFAULT_HTTP_TIMEOUT_MS;
+        this.httpRetries = Number.isInteger(options.httpRetries) ? options.httpRetries : DEFAULT_HTTP_RETRIES;
+        this.fileSystem = options.fileSystem || fs;
+        this.pythonRunner = options.pythonRunner || null;
+        this.pythonPath = options.pythonPath || null;
+        this.tempRoot = options.tempRoot || path.join(os.tmpdir(), 'home-run-bot');
+        this.pythonCommand = null;
+        this.pythonArgsPrefix = [];
+        this.ballparkDataVersion = null;
+        this.ballparkMetadataVersion = null;
+        this.pythonPreflightPromise = null;
+        this.analysisAvailable = false;
+        this.analysisPermanentlyUnavailable = false;
+        this.analysisUnavailableReason = null;
+        this.initializationComplete = false;
+
         // Players to monitor
         this.players = {
-            '592450': { name: 'Aaron Judge', team: 'NYY', number: '99', lastCheckedHR: 0, sentHomeRuns: new Set(), homeRunParks: {} },
-            '700250': { name: 'Ben Rice', team: 'NYY', number: '22', lastCheckedHR: 0, sentHomeRuns: new Set(), homeRunParks: {} },
-            '665742': { name: 'Juan Soto', team: 'NYM', number: '22', lastCheckedHR: 0, sentHomeRuns: new Set(), homeRunParks: {} },
-            '660271': { name: 'Shohei Ohtani', team: 'LAD', number: '17', lastCheckedHR: 0, sentHomeRuns: new Set(), homeRunParks: {} },
-            '656941': { name: 'Kyle Schwarber', team: 'PHI', number: '12', lastCheckedHR: 0, sentHomeRuns: new Set(), homeRunParks: {} },
-            '547180': { name: 'Bryce Harper', team: 'PHI', number: '3', lastCheckedHR: 0, sentHomeRuns: new Set(), homeRunParks: {} },
-            '683002': { name: 'Gunnar Henderson', team: 'BAL', number: '2', lastCheckedHR: 0, sentHomeRuns: new Set(), homeRunParks: {} },
-            '545361': { name: 'Mike Trout', team: 'LAA', number: '27', lastCheckedHR: 0, sentHomeRuns: new Set(), homeRunParks: {} }
+            '592450': { name: 'Aaron Judge', aliases: ['judge', 'aaron judge'], team: 'NYY', number: '99', lastCheckedHR: 0, sentHomeRuns: new Set(), homeRunParks: {} },
+            '700250': { name: 'Ben Rice', aliases: ['rice', 'ben rice'], team: 'NYY', number: '22', lastCheckedHR: 0, sentHomeRuns: new Set(), homeRunParks: {} },
+            '665742': { name: 'Juan Soto', aliases: ['soto', 'juan soto'], team: 'NYM', number: '22', lastCheckedHR: 0, sentHomeRuns: new Set(), homeRunParks: {} },
+            '660271': { name: 'Shohei Ohtani', aliases: ['ohtani', 'shohei ohtani'], team: 'LAD', number: '17', lastCheckedHR: 0, sentHomeRuns: new Set(), homeRunParks: {} },
+            '656941': { name: 'Kyle Schwarber', aliases: ['schwarber', 'kyle schwarber'], team: 'PHI', number: '12', lastCheckedHR: 0, sentHomeRuns: new Set(), homeRunParks: {} },
+            '547180': { name: 'Bryce Harper', aliases: ['harper', 'bryce harper'], team: 'PHI', number: '3', lastCheckedHR: 0, sentHomeRuns: new Set(), homeRunParks: {} },
+            '683002': { name: 'Gunnar Henderson', aliases: ['gunnar', 'henderson', 'gunnar henderson'], team: 'BAL', number: '2', lastCheckedHR: 0, sentHomeRuns: new Set(), homeRunParks: {} },
+            '545361': { name: 'Mike Trout', aliases: ['trout', 'mike trout'], team: 'LAA', number: '27', lastCheckedHR: 0, sentHomeRuns: new Set(), homeRunParks: {} }
         };
         for (const playerData of Object.values(this.players)) {
             playerData.sentHomeRunsByChannel = {};
+            playerData.alertMessagesByChannel = {};
+            playerData.eventAliases = {};
+            playerData.homeRunEvents = {};
+            playerData.checkpointInitialized = false;
+            playerData.lowerTotalObservation = null;
+            playerData.inventoryCorrectionCandidate = null;
+            playerData.baselineHomeRunIds = new Set();
+            playerData.baselineSnapshotInitialized = false;
+            playerData.authoritativeHomeRunIds = new Set();
+            playerData.authoritativeSnapshotInitialized = false;
+            playerData.authoritativeSnapshotCapturedAt = null;
+            playerData.lastKnownStats = null;
+            playerData.lastStatsFetchAttemptAt = null;
         }
 
-        this.statePath = options.statePath || path.join(__dirname, 'data', 'bot_state.json');
+        this.statePath = resolveStatePath(options.statePath);
+        this.stateBackupPath = `${this.statePath}.bak`;
+        this.stateLeasePath = `${this.statePath}.lock`;
+        this.disableStateLock = Boolean(options.disableStateLock);
+        this.stateLeaseId = null;
         this.botUsername = options.botUsername || null;
         this.adminUserIds = new Set((options.adminUserIds || []).map(id => id.toString()));
+        this.allowedGuildIds = new Set((options.allowedGuildIds || []).map(id => id.toString()));
+        this.guildAllowlistReady = this.allowedGuildIds.size > 0;
+        this.processRef = options.processRef || process;
 
-        this.debugging = true;
         this.lastCheckTime = null;
-        this.checkInProgress = null;
-        this.pendingNotifications = new Set(); // hrIds currently waiting for Statcast before sending
-        this.startupCatchUpPlayerIds = new Set(); // restored players only send the latest missed HR after restart
-    }
-
-    getPlayerHeadshotUrl(playerName) {
-        const headshots = {
-            'Aaron Judge': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/592450/headshot/67/current',
-            'Ben Rice': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/700250/headshot/67/current',
-            'Juan Soto': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/665742/headshot/67/current',
-            'Shohei Ohtani': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660271/headshot/67/current',
-            'Kyle Schwarber': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/656941/headshot/67/current',
-            'Bryce Harper': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/547180/headshot/67/current',
-            'Gunnar Henderson': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/683002/headshot/67/current'
+        this.lastSuccessfulPollAt = null;
+        this.metrics = {
+            checksStarted: 0,
+            checksSucceeded: 0,
+            checksFailed: 0,
+            detected: 0,
+            queued: 0,
+            delivered: 0,
+            failed: 0,
+            enrichmentsTerminal: 0
         };
-        return headshots[playerName] || null;
+        this.checkInProgress = null;
+        this.pendingNotifications = new Set();
+        this.pendingEnrichments = new Map();
+        this.activeEnrichmentJobs = new Map();
+        this.activeEnrichmentRecords = new Map();
+        this.enrichmentQueue = [];
+        this.enrichmentActive = 0;
+        this.maxEnrichmentConcurrency = options.enrichmentConcurrency || DEFAULT_ENRICHMENT_CONCURRENCY;
+        this.enrichmentMaxAgeMs =
+            options.enrichmentMaxAgeMs || DEFAULT_ENRICHMENT_MAX_AGE_MS;
+        this.enrichmentMaxDataAttempts =
+            options.enrichmentMaxDataAttempts || DEFAULT_ENRICHMENT_MAX_DATA_ATTEMPTS;
+        this.authoritativeReconciliationIntervalMs =
+            options.authoritativeReconciliationIntervalMs ||
+            DEFAULT_AUTHORITATIVE_RECONCILIATION_INTERVAL_MS;
+        this.analysisQueue = [];
+        this.analysisActive = 0;
+        this.maxAnalysisConcurrency = options.analysisConcurrency || DEFAULT_ANALYSIS_CONCURRENCY;
+        this.backfillPromises = new Map();
+        this.backfillLastStartedAt = new Map();
+        this.inventoryReconciliationPlayerIds = new Set();
+        this.playerMutationLocks = new Map();
+        this.inventoryReconciliationLocks = new Map();
+        this.discordMessageMutationLocks = new Map();
+        this.discordEventMutationLocks = new Map();
+        this.backfillBatchSize =
+            options.backfillBatchSize || options.backfillLimit || DEFAULT_BACKFILL_LIMIT;
+        this.backfillCooldownMs = options.backfillCooldownMs || DEFAULT_BACKFILL_COOLDOWN_MS;
+        this.pollIntervalMs = options.pollIntervalMs || 240000;
+        this.offseasonPollIntervalMs = options.offseasonPollIntervalMs || 6 * 60 * 60 * 1000;
+        this.pollJitterMs = Number.isInteger(options.pollJitterMs) ? options.pollJitterMs : 30000;
+        this.backgroundJobs = new Set();
+        this.activeTempDirectories = new Set();
+        this.gameLogCache = new Map();
+        this.playByPlayCache = new Map();
+        this.gameMetadataCache = new Map();
+        this.statcastCache = new Map();
+        this.displayStatsPromises = new Map();
+        this.statsRequestSequences = new Map();
+        this.analysisCache = new Map();
+        this.gameLogCacheTtlMs = options.gameLogCacheTtlMs || 120000;
+        this.playByPlayCacheTtlMs = options.playByPlayCacheTtlMs || 60000;
+        this.gameMetadataCacheTtlMs = options.gameMetadataCacheTtlMs || 300000;
+        this.statcastCacheTtlMs = options.statcastCacheTtlMs || 30000;
+        this.displayStatsCacheTtlMs = options.displayStatsCacheTtlMs || 60000;
+        this.monitorTask = null;
+        this.enrichmentWakeTimer = null;
+        this.gatewayReadyPromise = null;
+        this.readyPromise = null;
+        this.shuttingDown = false;
+        this.shutdownPromise = null;
+        this.shutdownFinalizePromise = null;
+        this.discordDestroyed = false;
+        this.fatalShutdownPromise = null;
+        this.removeProcessHandlers = null;
+        this.shutdownTimeoutMs = options.shutdownTimeoutMs || DEFAULT_SHUTDOWN_TIMEOUT_MS;
+        this.readyTimeoutMs = options.readyTimeoutMs || DEFAULT_READY_TIMEOUT_MS;
+        this.startupCatchUpPlayerIds = new Set();
     }
 
     getPlayerHeadshotUrlById(playerId) {
@@ -68,77 +772,378 @@ class BaseballBot {
     }
 
     loadState() {
-        if (!fs.existsSync(this.statePath)) {
+        const fileSystem = this.fileSystem;
+        if (!fileSystem.existsSync(this.statePath) && !fileSystem.existsSync(this.stateBackupPath)) {
             return new Set();
         }
 
         try {
-            const rawState = fs.readFileSync(this.statePath, 'utf8');
-            const parsedState = JSON.parse(rawState);
+            let parsedState;
+            let primaryError = null;
+            try {
+                parsedState = validateStateDocument(
+                    JSON.parse(fileSystem.readFileSync(this.statePath, 'utf8'))
+                );
+            } catch (error) {
+                primaryError = error;
+                if (!fileSystem.existsSync(this.stateBackupPath)) {
+                    throw error;
+                }
+                parsedState = validateStateDocument(
+                    JSON.parse(fileSystem.readFileSync(this.stateBackupPath, 'utf8'))
+                );
+            }
+            if (primaryError) {
+                this.log(`Primary state is invalid (${primaryError.message}); loaded last-known-good backup`);
+            }
 
-            if (parsedState.season !== this.currentSeason || !parsedState.players) {
-                return new Set();
+            const savedSeason = Number(parsedState.season);
+            if (savedSeason > this.currentSeason) {
+                throw new Error(
+                    `state season ${savedSeason} is newer than the active season ` +
+                    `${this.currentSeason}; verify the system clock`
+                );
+            }
+            if (savedSeason < this.currentSeason) {
+                this.log(
+                    `Rolling prior-season state ${savedSeason} forward to ` +
+                    `${this.currentSeason} with an explicit zero checkpoint`
+                );
+                for (const playerData of Object.values(this.players)) {
+                    playerData.lastCheckedHR = 0;
+                    playerData.checkpointInitialized = true;
+                    playerData.baselineHomeRunIds = new Set();
+                    playerData.baselineSnapshotInitialized = true;
+                    playerData.authoritativeHomeRunIds = new Set();
+                    playerData.authoritativeSnapshotInitialized = true;
+                    playerData.authoritativeSnapshotCapturedAt =
+                        this.clock().toISOString();
+                }
+                return new Set(Object.keys(this.players));
             }
 
             const restoredPlayers = new Set();
+            const currentReconstructionVersion =
+                Number(parsedState.version || 0) >= STATE_VERSION;
             for (const [playerId, savedState] of Object.entries(parsedState.players)) {
-                if (!this.players[playerId]) {
+                if (!this.players[playerId] || !savedState || typeof savedState !== 'object') {
                     continue;
                 }
 
-                this.players[playerId].lastCheckedHR = Number(savedState.lastCheckedHR) || 0;
-                const legacySentHomeRuns = Array.isArray(savedState.sentHomeRuns) ? savedState.sentHomeRuns : [];
-                this.players[playerId].sentHomeRuns = new Set(legacySentHomeRuns);
-                this.players[playerId].sentHomeRunsByChannel = {};
+                const playerData = this.players[playerId];
+                const parsedCheckpoint = Number(savedState.lastCheckedHR);
+                playerData.lastCheckedHR = parsedCheckpoint;
+                playerData.checkpointInitialized =
+                    savedState.checkpointInitialized !== false;
+                playerData.lowerTotalObservation = savedState.lowerTotalObservation &&
+                    Number.isInteger(savedState.lowerTotalObservation.value) &&
+                    Number.isInteger(savedState.lowerTotalObservation.count)
+                    ? savedState.lowerTotalObservation
+                    : null;
+                playerData.inventoryCorrectionCandidate =
+                    savedState.inventoryCorrectionCandidate &&
+                    typeof savedState.inventoryCorrectionCandidate ===
+                        'object'
+                        ? {
+                            ...savedState.inventoryCorrectionCandidate,
+                            eventIds: [
+                                ...(savedState
+                                    .inventoryCorrectionCandidate
+                                    .eventIds || [])
+                            ]
+                        }
+                        : null;
+                playerData.baselineHomeRunIds = new Set(
+                    Array.isArray(savedState.baselineHomeRunIds)
+                        ? savedState.baselineHomeRunIds.map(String)
+                        : []
+                );
+                playerData.baselineSnapshotInitialized = Boolean(
+                    savedState.baselineSnapshotInitialized
+                );
+                playerData.authoritativeHomeRunIds = new Set(
+                    Array.isArray(savedState.authoritativeHomeRunIds)
+                        ? savedState.authoritativeHomeRunIds.map(String)
+                        : []
+                );
+                playerData.authoritativeSnapshotInitialized = Boolean(
+                    savedState.authoritativeSnapshotInitialized
+                );
+                playerData.authoritativeSnapshotCapturedAt =
+                    Number.isFinite(Date.parse(
+                        savedState.authoritativeSnapshotCapturedAt
+                    ))
+                        ? savedState.authoritativeSnapshotCapturedAt
+                        : null;
+
+                const legacySentHomeRuns = Array.isArray(savedState.sentHomeRuns)
+                    ? savedState.sentHomeRuns.map(String)
+                    : [];
+                playerData.sentHomeRuns = new Set(legacySentHomeRuns);
+                playerData.sentHomeRunsByChannel = {};
+                playerData.alertMessagesByChannel = {};
+                const savedUpdatedAt = parsedState.updatedAt || this.clock().toISOString();
                 for (const channelId of this.channelIds) {
                     const perChannelSentHomeRuns = Array.isArray(savedState.sentHomeRunsByChannel?.[channelId])
-                        ? savedState.sentHomeRunsByChannel[channelId]
+                        ? savedState.sentHomeRunsByChannel[channelId].map(String)
                         : legacySentHomeRuns;
-                    this.players[playerId].sentHomeRunsByChannel[channelId] = new Set(perChannelSentHomeRuns);
+                    playerData.sentHomeRunsByChannel[channelId] = new Set(perChannelSentHomeRuns);
+
+                    const savedRecords = savedState.alertMessagesByChannel?.[channelId];
+                    playerData.alertMessagesByChannel[channelId] =
+                        savedRecords && typeof savedRecords === 'object'
+                            ? Object.fromEntries(
+                                Object.entries(savedRecords).map(
+                                    ([eventId, record]) => {
+                                        const restoredRecord = { ...record };
+                                        delete restoredRecord.retractionInProgress;
+                                        return [eventId, restoredRecord];
+                                    }
+                                )
+                            )
+                            : {};
+                    for (const eventId of perChannelSentHomeRuns) {
+                        if (!playerData.alertMessagesByChannel[channelId][eventId]) {
+                            if (currentReconstructionVersion) {
+                                throw new Error(
+                                    `Current state lacks an alert record for ${eventId} in ${channelId}`
+                                );
+                            }
+                            playerData.alertMessagesByChannel[channelId][eventId] = {
+                                messageId: null,
+                                basicSentAt: savedUpdatedAt,
+                                enrichedAt: savedUpdatedAt,
+                                deliveryMode: 'legacy-migrated'
+                            };
+                        }
+                    }
                 }
-                this.rebuildSentHomeRuns(this.players[playerId]);
-                this.players[playerId].homeRunParks = savedState.homeRunParks || {};
-                restoredPlayers.add(playerId);
+                playerData.eventAliases = currentReconstructionVersion &&
+                    savedState.eventAliases && typeof savedState.eventAliases === 'object'
+                    ? { ...savedState.eventAliases }
+                    : {};
+                playerData.homeRunEvents = currentReconstructionVersion &&
+                    savedState.homeRunEvents &&
+                    typeof savedState.homeRunEvents === 'object'
+                    ? { ...savedState.homeRunEvents }
+                    : {};
+                playerData.lastKnownStats = savedState.lastKnownStats &&
+                    typeof savedState.lastKnownStats === 'object' &&
+                    savedState.lastKnownStats.stats &&
+                    typeof savedState.lastKnownStats.stats === 'object'
+                    ? {
+                        stats: { ...savedState.lastKnownStats.stats },
+                        fetchedAt: savedState.lastKnownStats.fetchedAt || parsedState.updatedAt || null
+                    }
+                    : null;
+                this.rebuildSentHomeRuns(playerData);
+                playerData.homeRunParks = currentReconstructionVersion &&
+                    savedState.homeRunParks &&
+                    typeof savedState.homeRunParks === 'object' ? savedState.homeRunParks : {};
+                if (playerData.checkpointInitialized) {
+                    restoredPlayers.add(playerId);
+                }
+            }
+
+            const pendingRecords = parsedState.pendingEnrichments;
+            if (pendingRecords && typeof pendingRecords === 'object') {
+                for (const [jobKey, record] of Object.entries(pendingRecords)) {
+                    if (!record || !this.players[String(record.playerId)] ||
+                        Number(record.season) !== this.currentSeason || !record.hrDetail) {
+                        continue;
+                    }
+                    const targetChannelIds = Array.isArray(record.channelIds)
+                        ? [...new Set(record.channelIds.map(String))].filter(id => this.channelIds.includes(id))
+                        : [];
+                    if (targetChannelIds.length > 0) {
+                        this.pendingEnrichments.set(jobKey, { ...record, channelIds: targetChannelIds });
+                    }
+                }
+            }
+
+            for (const [playerId, playerData] of Object.entries(this.players)) {
+                for (const channelId of this.channelIds) {
+                    for (const [eventId, delivery] of Object.entries(
+                        playerData.alertMessagesByChannel[channelId] || {}
+                    )) {
+                        if (!delivery?.basicSentAt ||
+                            delivery.enrichedAt ||
+                            delivery.retractedAt ||
+                            delivery.enrichmentFailedAt ||
+                            !delivery.hrDetail) {
+                            continue;
+                        }
+                        const hrId = String(eventId);
+                        const season = Number(delivery.season) || this.currentSeason;
+                        const jobKey = `${season}:${playerId}:${hrId}`;
+                        const existing = this.pendingEnrichments.get(jobKey);
+                        const channelIds = [...new Set([...(existing?.channelIds || []), channelId])];
+                        this.pendingEnrichments.set(jobKey, {
+                            playerId,
+                            season,
+                            hrId,
+                            totalHomeRuns: Number(delivery.totalHomeRuns) || null,
+                            hrDetail: delivery.hrDetail,
+                            createdAt: delivery.basicSentAt,
+                            attempts: 0,
+                            ...existing,
+                            channelIds
+                        });
+                    }
+                }
             }
 
             return restoredPlayers;
         } catch (error) {
-            this.log(`Could not load state file: ${error.message}`);
-            return new Set();
+            this.logEvent('fatal', 'state_load_failed', {
+                statePath: this.statePath,
+                backupPath: this.stateBackupPath,
+                error: error.message
+            });
+            throw new Error(`No valid current state file could be loaded: ${error.message}`, {
+                cause: error
+            });
         }
     }
 
-    saveState() {
+    serializeState() {
+        const serializedPlayers = {};
+        for (const [playerId, playerData] of Object.entries(this.players)) {
+            this.ensurePlayerDeliveryState(playerData);
+            this.rebuildSentHomeRuns(playerData);
+            const serializedPerChannelState = {};
+            const serializedAlertRecords = {};
+            for (const channelId of this.channelIds) {
+                serializedPerChannelState[channelId] = Array.from(playerData.sentHomeRunsByChannel[channelId]);
+                serializedAlertRecords[channelId] = Object.fromEntries(
+                    Object.entries(
+                        playerData.alertMessagesByChannel[channelId] || {}
+                    ).map(([eventId, record]) => {
+                        const serializedRecord = { ...record };
+                        delete serializedRecord.retractionInProgress;
+                        return [eventId, serializedRecord];
+                    })
+                );
+            }
+
+            serializedPlayers[playerId] = {
+                lastCheckedHR: playerData.lastCheckedHR,
+                checkpointInitialized: Boolean(playerData.checkpointInitialized),
+                lowerTotalObservation: playerData.lowerTotalObservation || null,
+                inventoryCorrectionCandidate:
+                    playerData.inventoryCorrectionCandidate || null,
+                baselineHomeRunIds: Array.from(playerData.baselineHomeRunIds),
+                baselineSnapshotInitialized: Boolean(
+                    playerData.baselineSnapshotInitialized
+                ),
+                authoritativeHomeRunIds: Array.from(
+                    playerData.authoritativeHomeRunIds
+                ),
+                authoritativeSnapshotInitialized: Boolean(
+                    playerData.authoritativeSnapshotInitialized
+                ),
+                authoritativeSnapshotCapturedAt:
+                    playerData.authoritativeSnapshotCapturedAt || null,
+                sentHomeRuns: Array.from(playerData.sentHomeRuns),
+                sentHomeRunsByChannel: serializedPerChannelState,
+                alertMessagesByChannel: serializedAlertRecords,
+                eventAliases: playerData.eventAliases || {},
+                homeRunEvents: playerData.homeRunEvents || {},
+                homeRunParks: playerData.homeRunParks || {},
+                lastKnownStats: playerData.lastKnownStats || null
+            };
+        }
+
+        return {
+            version: STATE_VERSION,
+            season: this.currentSeason,
+            updatedAt: this.clock().toISOString(),
+            players: serializedPlayers,
+            pendingEnrichments: Object.fromEntries(this.pendingEnrichments)
+        };
+    }
+
+    saveState({ throwOnError = false } = {}) {
+        const fileSystem = this.fileSystem;
+        let temporaryPath = null;
+        let backupTemporaryPath = null;
         try {
+            const stateDocument = this.serializeState();
+            validateStateDocument(stateDocument);
             const stateDir = path.dirname(this.statePath);
-            if (!fs.existsSync(stateDir)) {
-                fs.mkdirSync(stateDir, { recursive: true });
+            if (!fileSystem.existsSync(stateDir)) {
+                fileSystem.mkdirSync(stateDir, { recursive: true });
             }
 
-            const serializedPlayers = {};
-            for (const [playerId, playerData] of Object.entries(this.players)) {
-                this.ensurePlayerDeliveryState(playerData);
-                this.rebuildSentHomeRuns(playerData);
-                const serializedPerChannelState = {};
-                for (const channelId of this.channelIds) {
-                    serializedPerChannelState[channelId] = Array.from(playerData.sentHomeRunsByChannel[channelId]);
+            temporaryPath = path.join(
+                stateDir,
+                `.${path.basename(this.statePath)}.${process.pid}.${crypto.randomUUID()}.tmp`
+            );
+            const payload = `${JSON.stringify(stateDocument, null, 2)}\n`;
+            const descriptor = fileSystem.openSync(temporaryPath, 'wx', 0o600);
+            try {
+                fileSystem.writeFileSync(descriptor, payload, 'utf8');
+                if (typeof fileSystem.fsyncSync === 'function') {
+                    fileSystem.fsyncSync(descriptor);
                 }
-
-                serializedPlayers[playerId] = {
-                    lastCheckedHR: playerData.lastCheckedHR,
-                    sentHomeRuns: Array.from(playerData.sentHomeRuns),
-                    sentHomeRunsByChannel: serializedPerChannelState,
-                    homeRunParks: playerData.homeRunParks || {}
-                };
+            } finally {
+                fileSystem.closeSync(descriptor);
             }
-
-            fs.writeFileSync(this.statePath, JSON.stringify({
-                season: this.currentSeason,
-                updatedAt: new Date().toISOString(),
-                players: serializedPlayers
-            }, null, 2));
+            if (fileSystem.existsSync(this.statePath)) {
+                let currentStateIsValid = false;
+                try {
+                    validateStateDocument(JSON.parse(fileSystem.readFileSync(this.statePath, 'utf8')));
+                    currentStateIsValid = true;
+                } catch {}
+                if (currentStateIsValid) {
+                    backupTemporaryPath = path.join(
+                        stateDir,
+                        `.${path.basename(this.stateBackupPath)}.${process.pid}.${crypto.randomUUID()}.tmp`
+                    );
+                    fileSystem.copyFileSync(this.statePath, backupTemporaryPath);
+                    const backupDescriptor = fileSystem.openSync(backupTemporaryPath, 'r+');
+                    try {
+                        if (typeof fileSystem.fsyncSync === 'function') {
+                            fileSystem.fsyncSync(backupDescriptor);
+                        }
+                    } finally {
+                        fileSystem.closeSync(backupDescriptor);
+                    }
+                    fileSystem.renameSync(backupTemporaryPath, this.stateBackupPath);
+                    backupTemporaryPath = null;
+                }
+            }
+            fileSystem.renameSync(temporaryPath, this.statePath);
+            temporaryPath = null;
+            try {
+                const directoryDescriptor = fileSystem.openSync(stateDir, 'r');
+                try {
+                    if (typeof fileSystem.fsyncSync === 'function') {
+                        fileSystem.fsyncSync(directoryDescriptor);
+                    }
+                } finally {
+                    fileSystem.closeSync(directoryDescriptor);
+                }
+            } catch {
+                // Directory fsync is not supported on every platform (notably Windows).
+            }
+            return true;
         } catch (error) {
             this.log(`Could not save state file: ${error.message}`);
+            if (temporaryPath) {
+                try {
+                    fileSystem.unlinkSync(temporaryPath);
+                } catch {}
+            }
+            if (backupTemporaryPath) {
+                try {
+                    fileSystem.unlinkSync(backupTemporaryPath);
+                } catch {}
+            }
+            if (throwOnError) {
+                throw error;
+            }
+            return false;
         }
     }
 
@@ -150,6 +1155,40 @@ class BaseballBot {
         if (!playerData.sentHomeRunsByChannel || typeof playerData.sentHomeRunsByChannel !== 'object') {
             playerData.sentHomeRunsByChannel = {};
         }
+        if (!playerData.alertMessagesByChannel || typeof playerData.alertMessagesByChannel !== 'object') {
+            playerData.alertMessagesByChannel = {};
+        }
+        if (!playerData.eventAliases || typeof playerData.eventAliases !== 'object') {
+            playerData.eventAliases = {};
+        }
+        if (!playerData.homeRunEvents || typeof playerData.homeRunEvents !== 'object') {
+            playerData.homeRunEvents = {};
+        }
+        if (!(playerData.baselineHomeRunIds instanceof Set)) {
+            playerData.baselineHomeRunIds = new Set(
+                Array.isArray(playerData.baselineHomeRunIds)
+                    ? playerData.baselineHomeRunIds.map(String)
+                    : []
+            );
+        }
+        if (!(playerData.authoritativeHomeRunIds instanceof Set)) {
+            playerData.authoritativeHomeRunIds = new Set(
+                Array.isArray(playerData.authoritativeHomeRunIds)
+                    ? playerData.authoritativeHomeRunIds.map(String)
+                    : []
+            );
+        }
+        playerData.baselineSnapshotInitialized = Boolean(
+            playerData.baselineSnapshotInitialized
+        );
+        playerData.authoritativeSnapshotInitialized = Boolean(
+            playerData.authoritativeSnapshotInitialized
+        );
+        if (!Number.isFinite(Date.parse(
+            playerData.authoritativeSnapshotCapturedAt
+        ))) {
+            playerData.authoritativeSnapshotCapturedAt = null;
+        }
 
         for (const channelId of this.channelIds) {
             if (!(playerData.sentHomeRunsByChannel[channelId] instanceof Set)) {
@@ -158,7 +1197,19 @@ class BaseballBot {
                     : Array.from(playerData.sentHomeRuns);
                 playerData.sentHomeRunsByChannel[channelId] = new Set(existingIds);
             }
+            if (!playerData.alertMessagesByChannel[channelId] ||
+                typeof playerData.alertMessagesByChannel[channelId] !== 'object') {
+                playerData.alertMessagesByChannel[channelId] = {};
+            }
         }
+    }
+
+    getAlertDeliveryRecord(playerData, channelId, hrId, create = false) {
+        this.ensurePlayerDeliveryState(playerData);
+        if (!playerData.alertMessagesByChannel[channelId][hrId] && create) {
+            playerData.alertMessagesByChannel[channelId][hrId] = {};
+        }
+        return playerData.alertMessagesByChannel[channelId][hrId] || null;
     }
 
     rebuildSentHomeRuns(playerData) {
@@ -187,7 +1238,7 @@ class BaseballBot {
         return this.channelIds.filter(channelId => !playerData.sentHomeRunsByChannel[channelId].has(hrId));
     }
 
-    markHomeRunSentToChannels(playerData, hrId, channelIds) {
+    markHomeRunSentToChannels(playerData, hrId, channelIds, metadata = {}) {
         if (!Array.isArray(channelIds) || channelIds.length === 0) {
             return;
         }
@@ -198,6 +1249,13 @@ class BaseballBot {
                 playerData.sentHomeRunsByChannel[channelId] = new Set();
             }
             playerData.sentHomeRunsByChannel[channelId].add(hrId);
+            Object.assign(
+                this.getAlertDeliveryRecord(playerData, channelId, hrId, true),
+                {
+                    basicSentAt: metadata.basicSentAt || this.clock().toISOString(),
+                    ...metadata
+                }
+            );
         }
 
         this.rebuildSentHomeRuns(playerData);
@@ -208,24 +1266,27 @@ class BaseballBot {
         return this.channelIds.every(channelId => playerData.sentHomeRunsByChannel[channelId].has(hrId));
     }
 
-    countContiguousDeliveredHomeRuns(playerData, homeRunDetails, checkpointFloor = 0) {
+    countContiguousDeliveredHomeRuns(playerId, playerData, homeRunDetails, checkpointFloor = 0) {
         let deliveredCount = 0;
         const safeCheckpointFloor = Math.max(0, parseInt(checkpointFloor, 10) || 0);
+        this.ensurePlayerDeliveryState(playerData);
 
         for (let index = 0; index < homeRunDetails.length; index++) {
-            const totalHomeRuns = index + 1;
-            if (totalHomeRuns <= safeCheckpointFloor) {
-                deliveredCount = totalHomeRuns;
-                continue;
-            }
-
             const hrDetail = homeRunDetails[index];
             if (this.isFallbackHomeRunDetail(hrDetail)) {
                 break;
             }
 
-            const hrId = this.buildHomeRunId(hrDetail);
-            if (!this.isHomeRunFullySent(playerData, hrId)) {
+            const hrId = this.reconcileHomeRunAliases(playerId, playerData, hrDetail);
+            const acceptedAsBaseline =
+                playerData.baselineSnapshotInitialized &&
+                playerData.baselineHomeRunIds.has(hrId);
+            const legacyCheckpointFallback =
+                !playerData.baselineSnapshotInitialized &&
+                index < safeCheckpointFloor;
+            if (!acceptedAsBaseline &&
+                !legacyCheckpointFallback &&
+                !this.isHomeRunFullySent(playerData, hrId)) {
                 break;
             }
 
@@ -235,17 +1296,648 @@ class BaseballBot {
         return deliveredCount;
     }
 
+    prepareHomeRunInventory(playerId, homeRunDetails, count) {
+        const requestedCount = Math.max(0, Number.parseInt(count, 10) || 0);
+        const details = Array.isArray(homeRunDetails)
+            ? homeRunDetails.slice(0, requestedCount)
+            : [];
+        if (details.length !== requestedCount ||
+            details.some(detail => this.isFallbackHomeRunDetail(detail))) {
+            return null;
+        }
+
+        const prepared = details.map(detail => {
+            const identity = this.getHomeRunAliases(detail, playerId);
+            return {
+                detail,
+                canonicalId: identity.canonicalId,
+                aliases: identity.aliases
+            };
+        });
+        if (new Set(prepared.map(item => item.canonicalId)).size !== requestedCount) {
+            this.logEvent('warn', 'duplicate_home_run_inventory_identity', {
+                playerId: String(playerId),
+                requestedCount
+            });
+            return null;
+        }
+
+        const aliasOwners = new Map();
+        for (const item of prepared) {
+            for (const alias of item.aliases) {
+                const owner = aliasOwners.get(alias);
+                if (owner && owner !== item.canonicalId) {
+                    this.logEvent('warn', 'ambiguous_home_run_inventory_alias', {
+                        playerId: String(playerId),
+                        alias,
+                        eventIds: [owner, item.canonicalId]
+                    });
+                    return null;
+                }
+                aliasOwners.set(alias, item.canonicalId);
+            }
+        }
+        return prepared;
+    }
+
+    canonicalizeHomeRunInventory(playerId, playerData, homeRunDetails, count) {
+        const prepared = this.prepareHomeRunInventory(
+            playerId,
+            homeRunDetails,
+            count
+        );
+        if (!prepared) return null;
+
+        const eventIds = [];
+        for (const { detail } of prepared) {
+            const eventId = this.reconcileHomeRunAliases(
+                playerId,
+                playerData,
+                detail
+            );
+            eventIds.push(eventId);
+            playerData.homeRunEvents[eventId] = {
+                ...detail,
+                eventKey: eventId,
+                playerId: String(playerId),
+                season: this.currentSeason
+            };
+        }
+        return eventIds;
+    }
+
+    captureBaselineInventory(playerId, playerData, homeRunDetails, count) {
+        const eventIds = this.canonicalizeHomeRunInventory(
+            playerId,
+            playerData,
+            homeRunDetails,
+            count
+        );
+        if (!eventIds) return false;
+        playerData.baselineHomeRunIds = new Set(eventIds);
+        playerData.baselineSnapshotInitialized = true;
+        return true;
+    }
+
+    captureAuthoritativeInventory(playerId, playerData, homeRunDetails, count) {
+        const eventIds = this.canonicalizeHomeRunInventory(
+            playerId,
+            playerData,
+            homeRunDetails,
+            count
+        );
+        if (!eventIds) return null;
+        playerData.authoritativeHomeRunIds = new Set(eventIds);
+        playerData.authoritativeSnapshotInitialized = true;
+        playerData.authoritativeSnapshotCapturedAt =
+            this.clock().toISOString();
+        return eventIds;
+    }
+
+    async acquireKeyedLock(lockMap, key) {
+        const normalizedKey = String(key);
+        const previous = lockMap.get(normalizedKey) || Promise.resolve();
+        let releaseGate;
+        const gate = new Promise(resolve => {
+            releaseGate = resolve;
+        });
+        const tail = previous.catch(() => {}).then(() => gate);
+        lockMap.set(normalizedKey, tail);
+        await previous.catch(() => {});
+
+        let released = false;
+        return () => {
+            if (released) return;
+            released = true;
+            releaseGate();
+            if (lockMap.get(normalizedKey) === tail) {
+                lockMap.delete(normalizedKey);
+            }
+        };
+    }
+
+    async annotateRetractedHomeRun(playerId, playerData, eventId) {
+        let allAnnotated = true;
+        for (const channelId of this.channelIds) {
+            const releaseEventMutation =
+                await this.acquireKeyedLock(
+                    this.discordEventMutationLocks,
+                    `${channelId}:${eventId}`
+                );
+            try {
+                const delivery = this.getAlertDeliveryRecord(
+                    playerData,
+                    channelId,
+                    eventId
+                );
+                if (!delivery || delivery.retractedAt) continue;
+
+                let annotated = false;
+                delivery.retractionInProgress = true;
+                try {
+                    const channel =
+                        await this.client.channels.fetch(channelId);
+                    const messageIds = [...new Set([
+                        delivery.messageId,
+                        delivery.enrichmentMessageId
+                    ].filter(Boolean))];
+                    const failedMessageIds = [];
+                    for (const messageId of messageIds) {
+                        const releaseMessageMutation =
+                            await this.acquireKeyedLock(
+                                this.discordMessageMutationLocks,
+                                `${channelId}:${messageId}`
+                            );
+                        try {
+                            const message =
+                                await channel.messages.fetch(messageId);
+                            if (!message?.embeds?.[0]) {
+                                throw new Error(
+                                    'message has no editable alert embed'
+                                );
+                            }
+                            const embed =
+                                Discord.EmbedBuilder.from(
+                                    message.embeds[0]
+                                )
+                                    .setColor('#747F8D')
+                                    .setFooter({
+                                        text:
+                                            'MLB correction: this play is no longer counted as a home run.'
+                                    });
+                            await message.edit({ embeds: [embed] });
+                        } catch (error) {
+                            failedMessageIds.push(messageId);
+                            this.logEvent(
+                                'warn',
+                                'retracted_alert_edit_failed',
+                                {
+                                    playerId,
+                                    eventId,
+                                    channelId,
+                                    messageId,
+                                    error: error.message
+                                }
+                            );
+                        } finally {
+                            releaseMessageMutation();
+                        }
+                    }
+                    if ((messageIds.length === 0 ||
+                        failedMessageIds.length > 0) &&
+                        !delivery.correctionMessageId) {
+                        const correction = await channel.send({
+                            content:
+                                `Correction: MLB no longer counts the previously alerted ` +
+                                `${playerData.name} play (${eventId}) as a home run.`,
+                            allowedMentions: { parse: [] },
+                            nonce: this.buildDiscordNonce(
+                                'correction',
+                                channelId,
+                                eventId
+                            ),
+                            enforceNonce: true
+                        });
+                        delivery.correctionMessageId = correction?.id
+                            ? String(correction.id)
+                            : null;
+                    }
+                    annotated =
+                        (messageIds.length > 0 &&
+                            failedMessageIds.length === 0) ||
+                        Boolean(delivery.correctionMessageId);
+                } catch (error) {
+                    this.logEvent(
+                        'warn',
+                        'retracted_alert_annotation_failed',
+                        {
+                            playerId,
+                            eventId,
+                            channelId,
+                            error: error.message
+                        }
+                    );
+                } finally {
+                    delivery.retractionInProgress = false;
+                }
+                if (annotated) {
+                    delivery.retractedAt =
+                        this.clock().toISOString();
+                    try {
+                        this.saveState({ throwOnError: true });
+                    } catch (error) {
+                        this.scheduleFatalShutdown(
+                            'correction-ack-persistence-failed',
+                            error
+                        );
+                        throw error;
+                    }
+                } else {
+                    allAnnotated = false;
+                }
+            } finally {
+                releaseEventMutation();
+            }
+        }
+        return allAnnotated;
+    }
+
+    cancelEnrichmentsForEvent(playerId, eventId, reason) {
+        const matchesEvent = record =>
+            String(record?.playerId) === String(playerId) &&
+            [record?.hrId, ...(record?.previousHrIds || [])]
+                .map(String)
+                .includes(String(eventId));
+        const activeJobs = new Set();
+
+        for (const [jobKey, record] of [...this.pendingEnrichments]) {
+            if (!matchesEvent(record)) continue;
+            record.cancelledReason = reason;
+            this.pendingEnrichments.delete(jobKey);
+            this.enrichmentQueue = this.enrichmentQueue
+                .filter(queuedKey => queuedKey !== jobKey);
+        }
+        for (const [jobKey, record] of this.activeEnrichmentRecords) {
+            if (!matchesEvent(record)) continue;
+            record.cancelledReason = reason;
+            const job = this.activeEnrichmentJobs.get(jobKey);
+            if (job) activeJobs.add(job);
+        }
+        return [...activeJobs];
+    }
+
+    restoreEnrichmentForEvent(playerId, playerData, eventId) {
+        const channelIds = this.channelIds.filter(channelId => {
+            const delivery = this.getAlertDeliveryRecord(
+                playerData,
+                channelId,
+                eventId
+            );
+            return delivery?.basicSentAt &&
+                !delivery.enrichedAt &&
+                !delivery.retractedAt &&
+                !delivery.enrichmentFailedAt &&
+                delivery.hrDetail;
+        });
+        if (channelIds.length === 0) return false;
+
+        const delivery = this.getAlertDeliveryRecord(
+            playerData,
+            channelIds[0],
+            eventId
+        );
+        const season =
+            Number(delivery.season) || this.currentSeason;
+        this.queueEnrichment({
+            playerId: String(playerId),
+            season,
+            hrId: String(eventId),
+            totalHomeRuns:
+                Number(delivery.totalHomeRuns) || null,
+            hrDetail: {
+                ...delivery.hrDetail,
+                eventKey: String(eventId),
+                playerId: String(playerId),
+                season
+            },
+            channelIds,
+            createdAt:
+                delivery.basicSentAt ||
+                this.clock().toISOString(),
+            attempts: 0
+        }, { persist: false });
+        return true;
+    }
+
+    async reconcileAuthoritativeInventory(
+        playerId,
+        playerData,
+        details,
+        authoritativeTotal,
+        {
+            persist = true,
+            requireCorrectionConfirmation = false
+        } = {}
+    ) {
+        const release = await this.acquireKeyedLock(
+            this.inventoryReconciliationLocks,
+            playerId
+        );
+        try {
+            return await this.reconcileAuthoritativeInventoryCore(
+                playerId,
+                playerData,
+                details,
+                authoritativeTotal,
+                {
+                    persist,
+                    requireCorrectionConfirmation
+                }
+            );
+        } finally {
+            release();
+        }
+    }
+
+    async reconcileAuthoritativeInventoryCore(
+        playerId,
+        playerData,
+        details,
+        authoritativeTotal,
+        {
+            persist = true,
+            requireCorrectionConfirmation = false
+        } = {}
+    ) {
+        const reconciliationPlayerId = String(playerId);
+        this.inventoryReconciliationPlayerIds.add(reconciliationPlayerId);
+        try {
+            this.ensurePlayerDeliveryState(playerData);
+            const activeBackfill = this.backfillPromises.get(reconciliationPlayerId);
+            if (activeBackfill) {
+                await activeBackfill;
+                if (this.shuttingDown) return null;
+                const refreshedTotal =
+                    await this.getPlayerHomeRunTotal(playerId);
+                if (refreshedTotal !== authoritativeTotal) {
+                    this.logEvent(
+                        'warn',
+                        'inventory_snapshot_changed_after_backfill',
+                        {
+                            playerId,
+                            expectedTotal: authoritativeTotal,
+                            refreshedTotal
+                        }
+                    );
+                    return null;
+                }
+                details = authoritativeTotal > 0
+                    ? await this.getRecentHomeRunDetails(
+                        playerId,
+                        authoritativeTotal,
+                        { force: true }
+                    )
+                    : [];
+                const reconfirmedTotal =
+                    await this.getPlayerHomeRunTotal(playerId);
+                if (reconfirmedTotal !== authoritativeTotal) {
+                    this.logEvent(
+                        'warn',
+                        'inventory_snapshot_changed_during_backfill_refresh',
+                        {
+                            playerId,
+                            expectedTotal: authoritativeTotal,
+                            reconfirmedTotal
+                        }
+                    );
+                    return null;
+                }
+            }
+            const prepared = this.prepareHomeRunInventory(
+                playerId,
+                details,
+                authoritativeTotal
+            );
+            if (!prepared) {
+                this.logEvent('warn', 'correction_inventory_unavailable', {
+                    playerId,
+                    authoritativeTotal
+                });
+                return null;
+            }
+
+            const prospectiveIds = new Set(
+                prepared.map(item => item.canonicalId)
+            );
+            const aliasOwners = new Map();
+            for (const item of prepared) {
+                for (const alias of item.aliases) {
+                    aliasOwners.set(alias, item.canonicalId);
+                }
+            }
+            const priorIds = playerData.authoritativeSnapshotInitialized
+                ? new Set(playerData.authoritativeHomeRunIds)
+                : new Set([
+                    ...Object.keys(playerData.homeRunEvents || {}),
+                    ...this.channelIds.flatMap(channelId =>
+                        [...(playerData.sentHomeRunsByChannel[channelId] || [])]
+                    )
+                ]);
+            const removedIds = [...priorIds].filter(eventId =>
+                !prospectiveIds.has(eventId) && !aliasOwners.has(eventId)
+            );
+            if (removedIds.length > 0 &&
+                requireCorrectionConfirmation) {
+                const candidateEventIds =
+                    [...prospectiveIds].sort();
+                const digest = crypto.createHash('sha256')
+                    .update(JSON.stringify({
+                        authoritativeTotal,
+                        eventIds: candidateEventIds
+                    }))
+                    .digest('hex');
+                const priorCandidate =
+                    playerData.inventoryCorrectionCandidate;
+                if (priorCandidate?.digest !== digest) {
+                    playerData.inventoryCorrectionCandidate = {
+                        digest,
+                        authoritativeTotal,
+                        eventIds: candidateEventIds,
+                        observedAt: this.clock().toISOString()
+                    };
+                    try {
+                        this.saveState({ throwOnError: true });
+                    } catch (error) {
+                        this.scheduleFatalShutdown(
+                            'inventory-correction-candidate-persistence-failed',
+                            error
+                        );
+                        throw error;
+                    }
+                    this.logEvent(
+                        'warn',
+                        'inventory_correction_waiting_for_confirmation',
+                        {
+                            playerId,
+                            authoritativeTotal,
+                            removedEventIds: removedIds
+                        }
+                    );
+                    return null;
+                }
+            }
+
+            const activeCorrectionJobs = new Set();
+            for (const eventId of removedIds) {
+                for (const job of this.cancelEnrichmentsForEvent(
+                    playerId,
+                    eventId,
+                    'official-correction'
+                )) {
+                    activeCorrectionJobs.add(job);
+                }
+            }
+            if (activeCorrectionJobs.size > 0) {
+                await Promise.allSettled(activeCorrectionJobs);
+                if (this.shuttingDown) return null;
+            }
+
+            for (const eventId of removedIds) {
+                const annotated = await this.annotateRetractedHomeRun(
+                    playerId,
+                    playerData,
+                    eventId
+                );
+                if (!annotated) {
+                    for (const removedEventId of removedIds) {
+                        this.restoreEnrichmentForEvent(
+                            playerId,
+                            playerData,
+                            removedEventId
+                        );
+                    }
+                    try {
+                        this.saveState({ throwOnError: true });
+                    } catch (error) {
+                        this.scheduleFatalShutdown(
+                            'correction-restoration-persistence-failed',
+                            error
+                        );
+                        throw error;
+                    }
+                    this.logEvent('warn', 'correction_alert_annotation_deferred', {
+                        playerId,
+                        eventId
+                    });
+                    return null;
+                }
+            }
+
+            const eventIds = this.canonicalizeHomeRunInventory(
+                playerId,
+                playerData,
+                details,
+                authoritativeTotal
+            );
+            if (!eventIds) {
+                throw new Error(
+                    'Prepared authoritative inventory could not be committed'
+                );
+            }
+            const currentIds = new Set(eventIds);
+            for (const eventId of [...playerData.baselineHomeRunIds]) {
+                if (!currentIds.has(eventId)) {
+                    playerData.baselineHomeRunIds.delete(eventId);
+                }
+            }
+            for (const eventId of Object.keys(playerData.homeRunEvents)) {
+                if (!currentIds.has(eventId)) {
+                    delete playerData.homeRunEvents[eventId];
+                }
+            }
+            for (const eventId of Object.keys(playerData.homeRunParks)) {
+                if (!currentIds.has(eventId)) {
+                    delete playerData.homeRunParks[eventId];
+                }
+            }
+            for (const channelId of this.channelIds) {
+                for (const eventId of [
+                    ...playerData.sentHomeRunsByChannel[channelId]
+                ]) {
+                    if (!currentIds.has(eventId)) {
+                        playerData.sentHomeRunsByChannel[channelId].delete(
+                            eventId
+                        );
+                    }
+                }
+            }
+            playerData.authoritativeHomeRunIds = currentIds;
+            playerData.authoritativeSnapshotInitialized = true;
+            playerData.authoritativeSnapshotCapturedAt =
+                this.clock().toISOString();
+            playerData.inventoryCorrectionCandidate = null;
+            this.rebuildSentHomeRuns(playerData);
+            if (removedIds.length > 0 && playerData.checkpointInitialized) {
+                playerData.lastCheckedHR = Math.min(
+                    authoritativeTotal,
+                    playerData.lastCheckedHR,
+                    this.countContiguousDeliveredHomeRuns(
+                        playerId,
+                        playerData,
+                        details,
+                        0
+                    )
+                );
+            }
+            if (persist) {
+                try {
+                    this.saveState({ throwOnError: true });
+                } catch (error) {
+                    this.scheduleFatalShutdown(
+                        'inventory-reconciliation-persistence-failed',
+                        error
+                    );
+                    throw error;
+                }
+            }
+            if (removedIds.length > 0) {
+                this.logEvent('warn', 'official_inventory_correction_reconciled', {
+                    playerId,
+                    authoritativeTotal,
+                    removedEventIds: removedIds
+                });
+            }
+            return eventIds;
+        } finally {
+            this.inventoryReconciliationPlayerIds.delete(
+                reconciliationPlayerId
+            );
+        }
+    }
+
+    async reconcileDownwardCorrection(
+        playerId,
+        playerData,
+        correctedTotal
+    ) {
+        const details = correctedTotal > 0
+            ? await this.getRecentHomeRunDetails(
+                playerId,
+                correctedTotal,
+                { force: true }
+            )
+            : [];
+        const confirmedTotal = await this.getPlayerHomeRunTotal(playerId);
+        if (confirmedTotal !== correctedTotal) {
+            this.logEvent('warn', 'correction_snapshot_changed', {
+                playerId,
+                expectedTotal: correctedTotal,
+                confirmedTotal
+            });
+            return false;
+        }
+        const reconciled = await this.reconcileAuthoritativeInventory(
+            playerId,
+            playerData,
+            details,
+            correctedTotal
+        );
+        return Boolean(reconciled);
+    }
+
     createHomeRunDetail(overrides = {}) {
         return {
             distance: 'Distance not available',
-            rbi: 1,
-            rbiDescription: 'Solo HR',
+            rbi: null,
+            rbiDescription: 'HR (RBI pending)',
             detailStatus: 'confirmed',
             gameId: null,
             gameDate: null,
             eventKey: null,
             atBatIndex: null,
             gameHomeRunIndex: null,
+            playerId: null,
+            season: this.currentSeason,
             ...overrides
         };
     }
@@ -253,7 +1945,9 @@ class BaseballBot {
     createFallbackHomeRunDetails(count, playerId) {
         return Array.from({ length: count }, (_, index) => this.createHomeRunDetail({
             detailStatus: 'fallback',
-            eventKey: `${playerId}_${this.currentSeason}_fallback_${index + 1}`
+            playerId: String(playerId),
+            season: this.currentSeason,
+            eventKey: `hr:${this.currentSeason}:${playerId}:fallback:${index + 1}`
         }));
     }
 
@@ -263,17 +1957,27 @@ class BaseballBot {
         }
 
         return hrDetail.detailStatus === 'fallback' ||
-            (!hrDetail.gameId && String(hrDetail.eventKey || '').includes('_fallback_'));
+            (!hrDetail.gameId && String(hrDetail.eventKey || '').includes('fallback'));
     }
 
     sortHomeRunDetailsChronologically(details) {
         return (Array.isArray(details) ? details : [])
             .map((detail, index) => ({ detail, index }))
             .sort((left, right) => {
-                const leftDate = left.detail?.gameDate ? new Date(left.detail.gameDate).getTime() : Number.MAX_SAFE_INTEGER;
-                const rightDate = right.detail?.gameDate ? new Date(right.detail.gameDate).getTime() : Number.MAX_SAFE_INTEGER;
+                const leftDate = safeDateTimestamp(left.detail?.gameDate);
+                const rightDate = safeDateTimestamp(right.detail?.gameDate);
                 if (leftDate !== rightDate) {
                     return leftDate - rightDate;
+                }
+
+                const leftGameNumber = Number.isInteger(left.detail?.gameNumber)
+                    ? left.detail.gameNumber
+                    : Number.MAX_SAFE_INTEGER;
+                const rightGameNumber = Number.isInteger(right.detail?.gameNumber)
+                    ? right.detail.gameNumber
+                    : Number.MAX_SAFE_INTEGER;
+                if (leftGameNumber !== rightGameNumber) {
+                    return leftGameNumber - rightGameNumber;
                 }
 
                 const leftGameId = Number.parseInt(left.detail?.gameId, 10);
@@ -284,16 +1988,24 @@ class BaseballBot {
                     return safeLeftGameId - safeRightGameId;
                 }
 
-                const leftAtBatIndex = Number.isInteger(left.detail?.atBatIndex) ? left.detail.atBatIndex : Number.MAX_SAFE_INTEGER;
-                const rightAtBatIndex = Number.isInteger(right.detail?.atBatIndex) ? right.detail.atBatIndex : Number.MAX_SAFE_INTEGER;
-                if (leftAtBatIndex !== rightAtBatIndex) {
-                    return leftAtBatIndex - rightAtBatIndex;
+                const leftSlot = Number.isInteger(left.detail?.gameHomeRunIndex)
+                    ? left.detail.gameHomeRunIndex
+                    : Number.MAX_SAFE_INTEGER;
+                const rightSlot = Number.isInteger(right.detail?.gameHomeRunIndex)
+                    ? right.detail.gameHomeRunIndex
+                    : Number.MAX_SAFE_INTEGER;
+                if (leftSlot !== rightSlot) {
+                    return leftSlot - rightSlot;
                 }
 
-                const leftGameHomeRunIndex = Number.isInteger(left.detail?.gameHomeRunIndex) ? left.detail.gameHomeRunIndex : Number.MAX_SAFE_INTEGER;
-                const rightGameHomeRunIndex = Number.isInteger(right.detail?.gameHomeRunIndex) ? right.detail.gameHomeRunIndex : Number.MAX_SAFE_INTEGER;
-                if (leftGameHomeRunIndex !== rightGameHomeRunIndex) {
-                    return leftGameHomeRunIndex - rightGameHomeRunIndex;
+                const leftAtBatIndex = Number.isInteger(left.detail?.atBatIndex)
+                    ? left.detail.atBatIndex
+                    : Number.MAX_SAFE_INTEGER;
+                const rightAtBatIndex = Number.isInteger(right.detail?.atBatIndex)
+                    ? right.detail.atBatIndex
+                    : Number.MAX_SAFE_INTEGER;
+                if (leftAtBatIndex !== rightAtBatIndex) {
+                    return leftAtBatIndex - rightAtBatIndex;
                 }
 
                 return left.index - right.index;
@@ -301,49 +2013,314 @@ class BaseballBot {
             .map(item => item.detail);
     }
 
-    buildHomeRunId(hrDetail) {
-        if (hrDetail.eventKey) {
-            return hrDetail.eventKey;
+    buildHomeRunId(hrDetail, explicitPlayerId = null) {
+        const playerId = String(explicitPlayerId || hrDetail?.playerId || 'unknown');
+        const season = Number.parseInt(hrDetail?.season, 10) || this.currentSeason;
+        const gameId = String(hrDetail?.gameId || 'unknown');
+
+        if (Number.isInteger(hrDetail?.atBatIndex)) {
+            return `hr:${season}:${playerId}:${gameId}:ab:${hrDetail.atBatIndex}`;
+        }
+        if (Number.isInteger(hrDetail?.gameHomeRunIndex)) {
+            return `hr:${season}:${playerId}:${gameId}:slot:${hrDetail.gameHomeRunIndex}`;
+        }
+        if (String(hrDetail?.eventKey || '').startsWith('hr:')) {
+            return String(hrDetail.eventKey);
         }
 
-        return [
-            hrDetail.gameId || 'unknown',
-            hrDetail.gameDate || 'unknown',
-            hrDetail.gameHomeRunIndex || 'unknown',
-            hrDetail.distance || 'unknown',
-            hrDetail.rbi || 'unknown'
-        ].join('_');
+        const fallbackDigest = crypto.createHash('sha256')
+            .update(JSON.stringify({
+                playerId,
+                season,
+                gameId,
+                gameDate: hrDetail?.gameDate || null,
+                eventKey: hrDetail?.eventKey || null,
+                slot: hrDetail?.gameHomeRunIndex || null
+            }))
+            .digest('hex')
+            .slice(0, 16);
+        return `hr:${season}:${playerId}:${gameId}:fallback:${fallbackDigest}`;
     }
 
-    buildPlayIdentifiers(play, gameId, gameDate, gameHomeRunIndex) {
+    buildDiscordNonce(kind, channelId, eventId) {
+        const digest = crypto.createHash('sha256')
+            .update(`${kind}:${channelId}:${eventId}`)
+            .digest('hex')
+            .slice(0, 24);
+        return `${String(kind || 'm').charAt(0)}${digest}`;
+    }
+
+    getHomeRunAliases(hrDetail, explicitPlayerId = null) {
+        const playerId = String(explicitPlayerId || hrDetail?.playerId || 'unknown');
+        const season = Number.parseInt(hrDetail?.season, 10) || this.currentSeason;
+        const canonicalId = this.buildHomeRunId(hrDetail, playerId);
+        const aliases = new Set([canonicalId]);
+        const gameId = hrDetail?.gameId ? String(hrDetail.gameId) : null;
+        const slot = Number.isInteger(hrDetail?.gameHomeRunIndex) ? hrDetail.gameHomeRunIndex : null;
+
+        if (hrDetail?.eventKey) {
+            aliases.add(String(hrDetail.eventKey));
+        }
+        if (gameId && Number.isInteger(hrDetail?.atBatIndex)) {
+            aliases.add(`${gameId}_${hrDetail.atBatIndex}`);
+        }
+        if (gameId && slot !== null) {
+            aliases.add(`hr:${season}:${playerId}:${gameId}:slot:${slot}`);
+            aliases.add(`${gameId}_${hrDetail?.gameDate || 'unknown'}_placeholder_${slot}`);
+            aliases.add(`${gameId}_${hrDetail?.gameDate || 'unknown'}_${slot}`);
+        }
+        return { canonicalId, aliases: Array.from(aliases).filter(Boolean) };
+    }
+
+    reconcileHomeRunAliases(playerId, playerData, hrDetail) {
+        this.ensurePlayerDeliveryState(playerData);
+        const { canonicalId, aliases } = this.getHomeRunAliases(hrDetail, playerId);
+
+        for (const alias of aliases) {
+            playerData.eventAliases[alias] = canonicalId;
+        }
+        for (const channelId of this.channelIds) {
+            const sentSet = playerData.sentHomeRunsByChannel[channelId];
+            const records = playerData.alertMessagesByChannel[channelId];
+            const deliveredAlias = aliases.find(alias => alias !== canonicalId && sentSet.has(alias)) ||
+                (sentSet.has(canonicalId) ? canonicalId : null);
+            if (deliveredAlias) {
+                sentSet.add(canonicalId);
+                const recordAlias = aliases.find(alias => alias !== canonicalId && records[alias]);
+                if (recordAlias) {
+                    const aliasRecord = records[recordAlias];
+                    const aliasSnapshot = { ...aliasRecord };
+                    Object.assign(
+                        aliasRecord,
+                        records[canonicalId] || {},
+                        aliasSnapshot,
+                        {
+                            reconciledFrom: recordAlias,
+                            hrId: canonicalId,
+                            hrDetail: {
+                                ...(aliasRecord.hrDetail || {}),
+                                ...hrDetail,
+                                eventKey: canonicalId,
+                                playerId: String(playerId),
+                                season:
+                                    Number.parseInt(hrDetail?.season, 10) ||
+                                    this.currentSeason
+                            }
+                        }
+                    );
+                    records[canonicalId] = aliasRecord;
+                }
+            }
+            for (const alias of aliases) {
+                if (alias === canonicalId) continue;
+                sentSet.delete(alias);
+                delete records[alias];
+            }
+        }
+
+        if (!Object.prototype.hasOwnProperty.call(playerData.homeRunParks, canonicalId)) {
+            const parksAlias = aliases.find(alias => alias !== canonicalId &&
+                Object.prototype.hasOwnProperty.call(playerData.homeRunParks, alias)
+            );
+            if (parksAlias) {
+                playerData.homeRunParks[canonicalId] = playerData.homeRunParks[parksAlias];
+            }
+        }
+        if (!Object.prototype.hasOwnProperty.call(playerData.homeRunEvents, canonicalId)) {
+            const eventAlias = aliases.find(alias => alias !== canonicalId &&
+                Object.prototype.hasOwnProperty.call(playerData.homeRunEvents, alias)
+            );
+            if (eventAlias) {
+                playerData.homeRunEvents[canonicalId] = playerData.homeRunEvents[eventAlias];
+            }
+        }
+        for (const alias of aliases) {
+            if (alias === canonicalId) continue;
+            delete playerData.homeRunParks[alias];
+            delete playerData.homeRunEvents[alias];
+        }
+        for (const inventory of [
+            playerData.baselineHomeRunIds,
+            playerData.authoritativeHomeRunIds,
+        ]) {
+            if (aliases.some(alias => inventory.has(alias))) {
+                inventory.add(canonicalId);
+            }
+            for (const alias of aliases) {
+                if (alias !== canonicalId) inventory.delete(alias);
+            }
+        }
+        this.migratePendingEnrichmentAliases(
+            playerId,
+            Number.parseInt(hrDetail?.season, 10) || this.currentSeason,
+            canonicalId,
+            aliases,
+            hrDetail
+        );
+
+        this.rebuildSentHomeRuns(playerData);
+        return canonicalId;
+    }
+
+    migratePendingEnrichmentAliases(
+        playerId,
+        season,
+        canonicalId,
+        aliases,
+        canonicalDetail
+    ) {
+        const aliasSet = new Set(aliases.map(String));
+        const matchingEntries = [...this.pendingEnrichments.entries()]
+            .filter(([, record]) =>
+                String(record?.playerId) === String(playerId) &&
+                Number(record?.season) === Number(season) &&
+                aliasSet.has(String(record?.hrId))
+            );
+        if (matchingEntries.length === 0) return;
+
+        const canonicalJobKey = `${season}:${playerId}:${canonicalId}`;
+        const canonicalRecord =
+            this.pendingEnrichments.get(canonicalJobKey) || null;
+        const activeRecord = matchingEntries
+            .map(([, record]) => record)
+            .find(record => this.isEnrichmentRecordActive(record));
+        let targetRecord = activeRecord || canonicalRecord;
+        if (targetRecord && canonicalRecord && targetRecord !== canonicalRecord) {
+            this.mergeEnrichmentRecord(targetRecord, canonicalRecord);
+        }
+        for (const [oldJobKey, record] of matchingEntries) {
+            record.previousHrIds = [...new Set([
+                ...(record.previousHrIds || []),
+                String(record.hrId)
+            ])].filter(id => id !== canonicalId);
+            record.hrId = canonicalId;
+            record.hrDetail = {
+                ...(record.hrDetail || {}),
+                ...(canonicalDetail || {}),
+                eventKey: canonicalId,
+                playerId: String(playerId),
+                season
+            };
+
+            if (!targetRecord || targetRecord === record) {
+                targetRecord = record;
+            } else {
+                this.mergeEnrichmentRecord(targetRecord, record);
+                if (this.isEnrichmentRecordActive(record)) {
+                    record.cancelledReason = 'alias-superseded';
+                }
+            }
+            if (oldJobKey !== canonicalJobKey) {
+                this.pendingEnrichments.delete(oldJobKey);
+            }
+        }
+        this.pendingEnrichments.set(canonicalJobKey, targetRecord);
+        this.enrichmentQueue = [...new Set(this.enrichmentQueue.map(
+            queuedKey => matchingEntries.some(([oldKey]) => oldKey === queuedKey)
+                ? canonicalJobKey
+                : queuedKey
+        ))];
+    }
+
+    buildPlayIdentifiers(play, gameId, gameDate, gameHomeRunIndex, playerId = null) {
         const atBatIndex = Number.isInteger(play.about?.atBatIndex) ? play.about.atBatIndex : null;
-        const eventKey = atBatIndex !== null
-            ? `${gameId}_${atBatIndex}`
-            : `${gameId}_${gameDate || 'unknown'}_${gameHomeRunIndex}`;
+        const detail = {
+            playerId: playerId ? String(playerId) : null,
+            season: this.currentSeason,
+            gameId,
+            gameDate,
+            gameHomeRunIndex,
+            atBatIndex
+        };
 
         return {
             atBatIndex,
             gameHomeRunIndex,
-            eventKey
+            eventKey: this.buildHomeRunId(detail, playerId)
         };
     }
 
-    findPlayerIdByName(playerName) {
-        return Object.keys(this.players).find(id =>
-            this.players[id].name.toLowerCase().includes(playerName.toLowerCase())
+    resolvePlayerByName(playerName) {
+        const query = String(playerName || '').trim().toLowerCase();
+        if (!query) {
+            return { status: 'not_found', query, playerId: null, candidates: [] };
+        }
+        if (this.players[query]) {
+            return {
+                status: 'matched',
+                query,
+                playerId: query,
+                candidates: [{ playerId: query, name: this.players[query].name }]
+            };
+        }
+
+        const exactMatches = Object.entries(this.players)
+            .filter(([, player]) => [player.name, ...(player.aliases || [])]
+                .some(alias => alias.toLowerCase() === query))
+            .map(([playerId, player]) => ({ playerId, name: player.name }));
+        if (exactMatches.length === 1) {
+            return { status: 'matched', query, playerId: exactMatches[0].playerId, candidates: exactMatches };
+        }
+        if (exactMatches.length > 1) {
+            return { status: 'ambiguous', query, playerId: null, candidates: exactMatches };
+        }
+
+        const partialMatches = Object.entries(this.players)
+            .filter(([, player]) => [player.name, ...(player.aliases || [])]
+                .some(alias => alias.toLowerCase().includes(query)))
+            .map(([playerId, player]) => ({ playerId, name: player.name }));
+        if (partialMatches.length === 1) {
+            return {
+                status: 'matched',
+                query,
+                playerId: partialMatches[0].playerId,
+                candidates: partialMatches
+            };
+        }
+        return {
+            status: partialMatches.length > 1 ? 'ambiguous' : 'not_found',
+            query,
+            playerId: null,
+            candidates: partialMatches
+        };
+    }
+
+    formatPlayerResolutionError(playerName, resolution) {
+        if (resolution.status === 'ambiguous') {
+            const names = resolution.candidates.map(candidate => candidate.name).join(', ');
+            return `Player query "${playerName}" is ambiguous. Matches: ${names}. Please use a full name.`;
+        }
+        return `Could not find a tracked player matching "${playerName}".`;
+    }
+
+    getPlayerShortcutCommands() {
+        const candidates = new Map();
+        for (const [playerId, player] of Object.entries(this.players)) {
+            for (const alias of (player.aliases || [])) {
+                const normalizedAlias = String(alias).trim().toLowerCase();
+                if (!normalizedAlias || /\s/.test(normalizedAlias)) continue;
+                const command = `!${normalizedAlias}`;
+                const matches = candidates.get(command) || [];
+                matches.push(playerId);
+                candidates.set(command, matches);
+            }
+        }
+        return new Map(
+            [...candidates]
+                .filter(([, playerIds]) => playerIds.length === 1)
+                .map(([command, playerIds]) => [command, playerIds[0]])
         );
     }
 
-    isAdminMessage(message) {
-        if (this.adminUserIds.has(message.author.id)) {
-            return true;
+    isGuildAllowed(message) {
+        if (!message.guildId || !this.guildAllowlistReady) {
+            return false;
         }
+        return this.allowedGuildIds.has(message.guildId);
+    }
 
-        return Boolean(
-            message.member &&
-            message.member.permissions &&
-            message.member.permissions.has(Discord.PermissionFlagsBits.Administrator)
-        );
+    isAdminMessage(message) {
+        return Boolean(message?.author?.id && this.adminUserIds.has(message.author.id));
     }
 
     async ensureAdmin(message) {
@@ -351,7 +2328,7 @@ class BaseballBot {
             return true;
         }
 
-        await message.reply('That command is admin-only. Use a server admin account or add your Discord user ID to ADMIN_USER_IDS.');
+        await message.reply('That command is restricted to user IDs explicitly listed in ADMIN_USER_IDS.');
         return false;
     }
 
@@ -374,497 +2351,1097 @@ class BaseballBot {
     }
 
     log(message) {
-        const timestamp = new Date().toISOString();
-        console.log(`[${timestamp}] ${message}`);
+        this.logEvent('info', 'message', { message });
+    }
+
+    logEvent(level, event, context = {}) {
+        const record = {
+            timestamp: this.clock().toISOString(),
+            level,
+            event,
+            ...context
+        };
+        const output = JSON.stringify(record);
+        if (level === 'error' || level === 'fatal') {
+            console.error(output);
+        } else if (level === 'warn') {
+            console.warn(output);
+        } else {
+            console.log(output);
+        }
+    }
+
+    isProcessAlive(pid) {
+        if (!Number.isInteger(pid) || pid <= 0) return false;
+        try {
+            process.kill(pid, 0);
+            return true;
+        } catch (error) {
+            return error?.code === 'EPERM';
+        }
+    }
+
+    acquireStateLease() {
+        if (this.disableStateLock || this.stateLeaseId) return;
+        const fileSystem = this.fileSystem;
+        const stateDir = path.dirname(this.statePath);
+        if (!fileSystem.existsSync(stateDir)) {
+            fileSystem.mkdirSync(stateDir, { recursive: true });
+        }
+
+        const attemptAcquire = () => {
+            const leaseId = crypto.randomUUID();
+            const descriptor = fileSystem.openSync(this.stateLeasePath, 'wx', 0o600);
+            try {
+                const payload = JSON.stringify({
+                    version: 1,
+                    pid: process.pid,
+                    leaseId,
+                    createdAt: this.clock().toISOString(),
+                    statePath: path.basename(this.statePath)
+                });
+                fileSystem.writeFileSync(descriptor, `${payload}\n`, 'utf8');
+                if (typeof fileSystem.fsyncSync === 'function') fileSystem.fsyncSync(descriptor);
+            } finally {
+                fileSystem.closeSync(descriptor);
+            }
+            this.stateLeaseId = leaseId;
+        };
+
+        try {
+            attemptAcquire();
+            return;
+        } catch (error) {
+            if (error?.code !== 'EEXIST') throw error;
+        }
+
+        let existingLease = null;
+        let lockAgeMs = Number.POSITIVE_INFINITY;
+        try {
+            const stat = fileSystem.statSync(this.stateLeasePath);
+            lockAgeMs = Math.max(0, this.clock().getTime() - stat.mtimeMs);
+        } catch (error) {
+            if (error?.code === 'ENOENT') {
+                attemptAcquire();
+                return;
+            }
+            throw new Error(`Could not inspect existing state lease: ${error.message}`);
+        }
+        try {
+            existingLease = JSON.parse(fileSystem.readFileSync(this.stateLeasePath, 'utf8'));
+        } catch {}
+
+        const ownerAlive = this.isProcessAlive(Number(existingLease?.pid));
+        const ownerDescription = existingLease?.pid
+            ? `PID ${existingLease.pid}${ownerAlive ? ' (running)' : ' (not running)'}`
+            : `an unreadable owner (${Math.round(lockAgeMs / 1000)}s old)`;
+        throw new Error(
+            `State lease is held by ${ownerDescription}. ` +
+            'Refusing automatic recovery to prevent a two-process race; remove the lock manually only after verifying no bot is running.'
+        );
+    }
+
+    releaseStateLease() {
+        if (this.disableStateLock || !this.stateLeaseId) return;
+        try {
+            const existingLease = JSON.parse(this.fileSystem.readFileSync(this.stateLeasePath, 'utf8'));
+            if (existingLease.leaseId === this.stateLeaseId) {
+                this.fileSystem.unlinkSync(this.stateLeasePath);
+            }
+        } catch (error) {
+            if (error?.code !== 'ENOENT') {
+                this.log(`Could not release state lease: ${error.message}`);
+            }
+        } finally {
+            this.stateLeaseId = null;
+        }
+    }
+
+    async preflightConfiguredChannels() {
+        const failures = [];
+        const configuredGuildIds = new Set();
+        const requiredPermissions = [
+            ['ViewChannel', Discord.PermissionFlagsBits.ViewChannel],
+            ['SendMessages', Discord.PermissionFlagsBits.SendMessages],
+            ['EmbedLinks', Discord.PermissionFlagsBits.EmbedLinks],
+            ['AttachFiles', Discord.PermissionFlagsBits.AttachFiles],
+            ['ReadMessageHistory', Discord.PermissionFlagsBits.ReadMessageHistory]
+        ];
+
+        for (const channelId of this.channelIds) {
+            try {
+                const channel = await this.client.channels.fetch(channelId);
+                const sendable = channel &&
+                    (typeof channel.isSendable === 'function'
+                        ? channel.isSendable()
+                        : typeof channel.send === 'function');
+                if (!sendable) {
+                    throw new Error('channel is not sendable');
+                }
+                if (channel.guildId) configuredGuildIds.add(channel.guildId);
+
+                if (typeof channel.permissionsFor === 'function' && this.client.user) {
+                    const permissions = channel.permissionsFor(this.client.user);
+                    const missing = requiredPermissions
+                        .filter(([, flag]) => !permissions?.has(flag))
+                        .map(([name]) => name);
+                    if (typeof channel.isThread === 'function' && channel.isThread() &&
+                        !permissions?.has(Discord.PermissionFlagsBits.SendMessagesInThreads)) {
+                        missing.push('SendMessagesInThreads');
+                    }
+                    if (missing.length > 0) {
+                        throw new Error(`missing permissions: ${missing.join(', ')}`);
+                    }
+                }
+            } catch (error) {
+                failures.push(`${channelId}: ${error.message}`);
+            }
+        }
+
+        if (failures.length > 0) {
+            throw new Error(`Discord channel preflight failed (${failures.join('; ')})`);
+        }
+        if (this.allowedGuildIds.size === 0) {
+            this.allowedGuildIds = configuredGuildIds;
+            this.log(`Command guild allowlist derived from configured alert channels (${this.allowedGuildIds.size} guild(s))`);
+        }
+        this.guildAllowlistReady = this.allowedGuildIds.size > 0;
+        if (!this.guildAllowlistReady) {
+            throw new Error('No guild allowlist could be derived from the configured alert channels');
+        }
+    }
+
+    async ensureActiveSeason() {
+        const activeSeason = this.clock().getUTCFullYear();
+        if (activeSeason === this.currentSeason) return false;
+        if (activeSeason < this.currentSeason) {
+            throw new Error(
+                `System clock moved from season ${this.currentSeason} back to ` +
+                `${activeSeason}; refusing to overwrite newer state`
+            );
+        }
+
+        this.log(`Season rollover detected: ${this.currentSeason} -> ${activeSeason}`);
+        for (const record of this.activeEnrichmentRecords.values()) {
+            record.cancelledReason = 'season-rollover';
+        }
+        if (this.activeEnrichmentJobs.size > 0) {
+            await Promise.allSettled(this.activeEnrichmentJobs.values());
+            if (this.shuttingDown) return false;
+        }
+        this.currentSeason = activeSeason;
+        this.startupCatchUpPlayerIds = new Set(Object.keys(this.players));
+        this.pendingEnrichments.clear();
+        this.enrichmentQueue.length = 0;
+        if (this.enrichmentWakeTimer) {
+            clearTimeout(this.enrichmentWakeTimer);
+            this.enrichmentWakeTimer = null;
+        }
+        this.gameLogCache.clear();
+        this.playByPlayCache.clear();
+        this.gameMetadataCache.clear();
+        this.statcastCache.clear();
+        this.displayStatsPromises.clear();
+        this.backfillLastStartedAt.clear();
+        this.backfillPromises.clear();
+        for (const playerData of Object.values(this.players)) {
+            playerData.lastCheckedHR = 0;
+            playerData.checkpointInitialized = true;
+            playerData.lowerTotalObservation = null;
+            playerData.inventoryCorrectionCandidate = null;
+            playerData.baselineHomeRunIds = new Set();
+            playerData.baselineSnapshotInitialized = true;
+            playerData.authoritativeHomeRunIds = new Set();
+            playerData.authoritativeSnapshotInitialized = true;
+            playerData.authoritativeSnapshotCapturedAt =
+                this.clock().toISOString();
+            playerData.sentHomeRuns = new Set();
+            playerData.sentHomeRunsByChannel = {};
+            playerData.alertMessagesByChannel = {};
+            playerData.eventAliases = {};
+            playerData.homeRunEvents = {};
+            playerData.homeRunParks = {};
+            playerData.lastKnownStats = null;
+            playerData.lastStatsFetchAttemptAt = null;
+            this.ensurePlayerDeliveryState(playerData);
+        }
+        this.saveState({ throwOnError: true });
+        return true;
+    }
+
+    getRetryDelayMs(error, attempt) {
+        const retryAfter = error?.retryAfter;
+        if (typeof retryAfter === 'string' && retryAfter.trim()) {
+            const seconds = Number(retryAfter);
+            if (Number.isFinite(seconds) && seconds >= 0) {
+                return Math.min(60000, Math.ceil(seconds * 1000));
+            }
+            const dateDelay = Date.parse(retryAfter) - this.clock().getTime();
+            if (Number.isFinite(dateDelay) && dateDelay > 0) {
+                return Math.min(60000, dateDelay);
+            }
+        }
+        const baseDelay = Math.min(10000, 250 * (2 ** attempt));
+        return baseDelay + Math.floor(this.random() * Math.max(1, baseDelay * 0.25));
+    }
+
+    isRetryableHttpError(error) {
+        if (error?.name === 'AbortError' || error?.code === 'ETIMEDOUT') return true;
+        if (!Number.isInteger(error?.status)) return true;
+        return [408, 425, 429, 500, 502, 503, 504].includes(error.status);
+    }
+
+    async httpGet(url, options = {}) {
+        const {
+            responseType = 'json',
+            timeoutMs = this.httpTimeoutMs,
+            retries = this.httpRetries,
+            maxBytes = responseType === 'text' ? 25 * 1024 * 1024 : 5 * 1024 * 1024,
+            expectedContentTypes = responseType === 'json'
+                ? ['application/json']
+                : ['text/csv', 'text/plain', 'application/octet-stream']
+        } = options;
+
+        let lastError;
+        for (let attempt = 0; attempt <= retries; attempt++) {
+            try {
+                if (this.httpClient) {
+                    const response = typeof this.httpClient.get === 'function'
+                        ? await this.httpClient.get(url, { timeout: timeoutMs, responseType })
+                        : await this.httpClient(url, { method: 'GET', timeoutMs, responseType, maxBytes });
+                    if (!response || !Object.prototype.hasOwnProperty.call(response, 'data')) {
+                        throw new Error(`Injected HTTP client returned a malformed response for ${url}`);
+                    }
+                    return response;
+                }
+
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), timeoutMs);
+                let response;
+                try {
+                    response = await this.fetchImpl(url, {
+                        method: 'GET',
+                        headers: { accept: responseType === 'json' ? 'application/json' : 'text/csv,text/plain;q=0.9' },
+                        signal: controller.signal,
+                        redirect: 'follow'
+                    });
+                    const contentLength = Number(response.headers.get('content-length'));
+                    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+                        const error = new Error(`HTTP response exceeded ${maxBytes} bytes`);
+                        error.status = response.status;
+                        throw error;
+                    }
+
+                    if (!response.ok) {
+                        const error = new Error(`HTTP ${response.status} ${response.statusText}`.trim());
+                        error.status = response.status;
+                        error.retryAfter = response.headers.get('retry-after');
+                        throw error;
+                    }
+
+                    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+                    if (expectedContentTypes.length > 0 &&
+                        !expectedContentTypes.some(expected => contentType.includes(expected))) {
+                        throw new Error(`Unexpected content type "${contentType || 'missing'}" from ${new URL(url).host}`);
+                    }
+
+                    const chunks = [];
+                    let bytesRead = 0;
+                    if (response.body) {
+                        for await (const chunk of response.body) {
+                            const buffer = Buffer.from(chunk);
+                            bytesRead += buffer.byteLength;
+                            if (bytesRead > maxBytes) {
+                                controller.abort();
+                                throw new Error(`HTTP response exceeded ${maxBytes} bytes`);
+                            }
+                            chunks.push(buffer);
+                        }
+                    }
+                    const body = Buffer.concat(chunks, bytesRead);
+                    const text = body.toString('utf8');
+                    let data = text;
+                    if (responseType === 'json') {
+                        try {
+                            data = JSON.parse(text);
+                        } catch {
+                            throw new Error(`Malformed JSON from ${new URL(url).host}`);
+                        }
+                    }
+                    return { data, status: response.status, headers: response.headers };
+                } finally {
+                    clearTimeout(timeout);
+                }
+            } catch (error) {
+                lastError = error;
+                if (attempt >= retries || !this.isRetryableHttpError(error) || this.shuttingDown) {
+                    break;
+                }
+                const delay = this.getRetryDelayMs(error, attempt);
+                this.log(`HTTP attempt ${attempt + 1} failed (${error.message}); retrying in ${delay}ms`);
+                await this.sleep(delay);
+            }
+        }
+        throw lastError;
+    }
+
+    getStatsSplits(response, label) {
+        const stats = response?.data?.stats;
+        if (!Array.isArray(stats) || !stats[0] || !Array.isArray(stats[0].splits)) {
+            throw new Error(`${label} response did not contain stats splits`);
+        }
+        return stats[0].splits;
+    }
+
+    getAllPlays(response, label) {
+        const plays = response?.data?.allPlays ?? response?.data?.liveData?.plays?.allPlays;
+        if (!Array.isArray(plays)) {
+            throw new Error(`${label} response did not contain an allPlays array`);
+        }
+        return plays;
+    }
+
+    async getStableHomeRunInventory(playerId, expectedTotal) {
+        const details = expectedTotal > 0
+            ? await this.getRecentHomeRunDetails(
+                playerId,
+                expectedTotal,
+                { force: true }
+            )
+            : [];
+        const confirmedTotal = await this.getPlayerHomeRunTotal(playerId);
+        if (confirmedTotal !== expectedTotal) {
+            this.logEvent('warn', 'baseline_snapshot_changed', {
+                playerId: String(playerId),
+                expectedTotal,
+                confirmedTotal
+            });
+            return null;
+        }
+        return details;
+    }
+
+    async initializeTrackingBaselines(restoredPlayers) {
+        await Promise.all(Object.entries(this.players).map(
+            async ([playerId, playerData]) => {
+                if (this.shuttingDown) return;
+                if (restoredPlayers.has(playerId) && playerData.checkpointInitialized) {
+                    this.log(`Restored ${playerData.name}: ${playerData.lastCheckedHR} HRs`);
+                    return;
+                }
+
+                const currentHR = await this.getPlayerHomeRunTotal(playerId);
+                if (this.shuttingDown) return;
+                if (currentHR === null) {
+                    this.log(`Could not establish a baseline for ${playerData.name}; alerts remain gated until a valid total is available`);
+                    return;
+                }
+                const details = await this.getStableHomeRunInventory(
+                    playerId,
+                    currentHR
+                );
+                if (this.shuttingDown) return;
+                if (!details) {
+                    this.log(
+                        `Could not establish a stable baseline for ${playerData.name}; alerts remain gated`
+                    );
+                    return;
+                }
+                const baselineCaptured = this.captureBaselineInventory(
+                    playerId,
+                    playerData,
+                    details,
+                    currentHR
+                );
+                if (baselineCaptured) {
+                    this.captureAuthoritativeInventory(
+                        playerId,
+                        playerData,
+                        details,
+                        currentHR
+                    );
+                    playerData.lastCheckedHR = currentHR;
+                    playerData.checkpointInitialized = true;
+                } else {
+                    this.logEvent('warn', 'baseline_identity_snapshot_deferred', {
+                        playerId,
+                        player: playerData.name,
+                        homeRuns: currentHR
+                    });
+                }
+                this.log(`Initialized ${playerData.name}: ${currentHR} HRs`);
+            }
+        ));
+        if (this.shuttingDown) return;
+        this.saveState({ throwOnError: true });
+    }
+
+    async handleClientReady() {
+        if (this.shuttingDown) {
+            this.logEvent('info', 'late_ready_ignored_during_shutdown', {});
+            return;
+        }
+        this.log(`Bot logged in as ${this.client.user.tag}`);
+        await this.preflightConfiguredChannels();
+        if (this.shuttingDown) return;
+        const restoredPlayers = new Set(this.startupCatchUpPlayerIds);
+        await this.initializeTrackingBaselines(restoredPlayers);
+        if (this.shuttingDown) return;
+        await this.preflightPython().catch(error => {
+            this.analysisAvailable = false;
+            this.analysisPermanentlyUnavailable = true;
+            this.analysisUnavailableReason = error.message;
+            this.log(`Python analysis disabled: ${error.message}`);
+        });
+        if (this.shuttingDown) return;
+        let withdrawalJob;
+        withdrawalJob = this.withdrawStaleParkAnalysisDeliveries()
+            .catch(error => {
+                this.logEvent('error', 'park_analysis_withdrawal_job_failed', {
+                    error: error.message
+                });
+            })
+            .finally(() => {
+                this.backgroundJobs.delete(withdrawalJob);
+            });
+        this.backgroundJobs.add(withdrawalJob);
+        this.initializationComplete = true;
+        this.startMonitoring();
+        this.resumePendingEnrichments();
+        let profileJob;
+        profileJob = this.syncBotProfile().finally(() => {
+            this.backgroundJobs.delete(profileJob);
+        });
+        this.backgroundJobs.add(profileJob);
     }
 
     async initialize() {
         this.log('Initializing bot...');
         this.log(`Configured to send alerts to ${this.channelIds.length} channel(s): ${this.channelIds.join(', ')}`);
-        
-        const restoredPlayers = this.loadState();
+
+        this.acquireStateLease();
+        let restoredPlayers;
+        try {
+            restoredPlayers = this.loadState();
+        } catch (error) {
+            this.releaseStateLease();
+            throw error;
+        }
         this.startupCatchUpPlayerIds = new Set(restoredPlayers);
 
-        for (const playerId of Object.keys(this.players)) {
-            if (restoredPlayers.has(playerId)) {
-                this.log(`Restored ${this.players[playerId].name}: ${this.players[playerId].lastCheckedHR} HRs`);
-                continue;
+        let resolveReady;
+        let rejectReady;
+        let resolveGatewayReady;
+        let rejectGatewayReady;
+        this.gatewayReadyPromise = new Promise((resolve, reject) => {
+            resolveGatewayReady = resolve;
+            rejectGatewayReady = reject;
+        });
+        this.gatewayReadyPromise.catch(() => {});
+        this.readyPromise = new Promise((resolve, reject) => {
+            resolveReady = resolve;
+            rejectReady = reject;
+        });
+        // The CLI start path awaits this promise. Attaching a rejection handler here also
+        // prevents direct initialize() callers from creating an unobserved rejection.
+        this.readyPromise.catch(() => {});
+        this.client.once(Discord.Events.ClientReady, () => {
+            if (this.shuttingDown) {
+                this.logEvent('info', 'late_ready_ignored_during_shutdown', {});
+                return;
             }
+            resolveGatewayReady();
+            void this.handleClientReady().then(resolveReady).catch(async error => {
+                this.logEvent('fatal', 'ready_initialization_failed', { error: error.message });
+                this.processRef.exitCode = 1;
+                await this.shutdown('ready-initialization-error');
+                rejectReady(error);
+            });
+        });
 
-            const currentHR = await this.getPlayerHomeRuns(playerId);
-            this.players[playerId].lastCheckedHR = currentHR;
-            this.log(`Initialized ${this.players[playerId].name}: ${currentHR} HRs`);
+        this.client.on(Discord.Events.Error, (error) => {
+            this.logEvent('error', 'discord_client_error', {
+                error: error.message,
+                code: error.code || null
+            });
+        });
+
+        this.client.on(Discord.Events.MessageCreate, (message) => {
+            let commandJob;
+            commandJob = this.handleIncomingMessage(message)
+                .catch(async error => {
+                    this.log(
+                        `Command error in guild ${message.guildId || 'DM'}, ` +
+                        `channel ${message.channelId || 'unknown'}: ${error.message}`
+                    );
+                    if (this.shuttingDown ||
+                        typeof message.reply !== 'function') {
+                        return;
+                    }
+                    try {
+                        await message.reply(
+                            'That command could not be completed. The failure was logged; please try again later.'
+                        );
+                    } catch (replyError) {
+                        this.logEvent(
+                            'warn',
+                            'command_failure_reply_failed',
+                            {
+                                guildId: message.guildId || null,
+                                channelId: message.channelId || null,
+                                error: replyError.message
+                            }
+                        );
+                    }
+                })
+                .finally(() => {
+                    this.backgroundJobs.delete(commandJob);
+                });
+            this.backgroundJobs.add(commandJob);
+        });
+
+        try {
+            await this.client.login(this.token);
+        } catch (error) {
+            rejectGatewayReady(error);
+            rejectReady(error);
+            await this.shutdown('discord-login-failed');
+            throw error;
         }
+        return this;
+    }
 
-        this.saveState();
-        
-        this.client.on('ready', async () => {
-            this.log(`Bot logged in as ${this.client.user.tag}`);
-            await this.syncBotProfile();
-            this.startMonitoring();
-        });
-
-        this.client.on('error', (error) => {
-            this.log(`Discord client error: ${error.message}`);
-            console.error('Full error:', error);
-        });
-
-        this.client.on('messageCreate', async (message) => {
-            if (message.author.bot) return;
-            await this.handleCommand(message);
-        });
-
-        await this.client.login(this.token);
+    async handleIncomingMessage(message) {
+        if (this.shuttingDown || message.author?.bot) return;
+        if (!this.isGuildAllowed(message)) return;
+        if (!String(message.content || '').trim().startsWith('!')) return;
+        if (!this.initializationComplete) {
+            await message.reply(
+                'The bot is still starting and rebuilding its tracking state. Please try that command again shortly.'
+            );
+            return;
+        }
+        await this.handleCommand(message);
     }
 
     async getPlayerStats(playerId) {
+        const requestedSeason = this.currentSeason;
+        const normalizedPlayerId = String(playerId);
+        const playerData = this.players[normalizedPlayerId];
+        const requestSequence =
+            (this.statsRequestSequences.get(normalizedPlayerId) || 0) + 1;
+        this.statsRequestSequences.set(
+            normalizedPlayerId,
+            requestSequence
+        );
+        if (playerData) {
+            playerData.lastStatsFetchAttemptAt = this.clock().getTime();
+        }
         try {
-            const response = await axios.get(
-                `https://statsapi.mlb.com/api/v1/people/${playerId}/stats?stats=season&season=${this.currentSeason}&group=hitting`
+            const response = await this.httpGet(
+                `https://statsapi.mlb.com/api/v1/people/${playerId}/stats?stats=season&season=${requestedSeason}&group=hitting&gameType=R`
             );
-            
-            const stats = response.data.stats[0];
-            if (stats && stats.splits && stats.splits.length > 0) {
-                return stats.splits[0].stat;
+            if (requestedSeason !== this.currentSeason) return null;
+            const splits = this.getStatsSplits(response, `season stats for ${playerId}`);
+            const stat = splits[0]?.stat;
+            if (!stat || typeof stat !== 'object') return null;
+            if (playerData &&
+                this.statsRequestSequences.get(normalizedPlayerId) ===
+                    requestSequence) {
+                playerData.lastKnownStats = {
+                    stats: { ...stat },
+                    fetchedAt: this.clock().toISOString()
+                };
             }
-            return null;
+            return playerData?.lastKnownStats?.stats || stat;
         } catch (error) {
             this.log(`Error fetching stats for player ${playerId}: ${error.message}`);
             return null;
         }
     }
 
+    async getPlayerStatsForDisplay(playerId) {
+        const playerData = this.players[String(playerId)];
+        const now = this.clock().getTime();
+        const cached = playerData?.lastKnownStats;
+        const cachedAt = Date.parse(cached?.fetchedAt);
+        if (cached?.stats && Number.isFinite(cachedAt) &&
+            now - cachedAt <= this.displayStatsCacheTtlMs) {
+            return {
+                stats: cached.stats,
+                stale: false,
+                fetchedAt: cached.fetchedAt
+            };
+        }
+        if (Number.isFinite(playerData?.lastStatsFetchAttemptAt) &&
+            now - playerData.lastStatsFetchAttemptAt <= this.displayStatsCacheTtlMs) {
+            return {
+                stats: cached?.stats || null,
+                stale: true,
+                fetchedAt: cached?.fetchedAt || null
+            };
+        }
+        let fetchPromise = this.displayStatsPromises.get(String(playerId));
+        if (!fetchPromise) {
+            fetchPromise = this.getPlayerStats(playerId);
+            this.displayStatsPromises.set(String(playerId), fetchPromise);
+            fetchPromise.finally(() => {
+                if (this.displayStatsPromises.get(String(playerId)) === fetchPromise) {
+                    this.displayStatsPromises.delete(String(playerId));
+                }
+            });
+        }
+        const liveStats = await fetchPromise;
+        if (liveStats) {
+            return {
+                stats: liveStats,
+                stale: false,
+                fetchedAt: playerData?.lastKnownStats?.fetchedAt || null
+            };
+        }
+        const latestCached = playerData?.lastKnownStats;
+        if (latestCached?.stats &&
+            typeof latestCached.stats === 'object') {
+            return {
+                stats: latestCached.stats,
+                stale: true,
+                fetchedAt: latestCached.fetchedAt || null
+            };
+        }
+        return { stats: null, stale: true, fetchedAt: null };
+    }
+
+    formatSnapshotAge(fetchedAt) {
+        const timestamp = Date.parse(fetchedAt);
+        if (!Number.isFinite(timestamp)) return 'from an unknown time';
+        const ageMs = Math.max(0, this.clock().getTime() - timestamp);
+        if (ageMs < 60 * 1000) return 'less than a minute old';
+        if (ageMs < 60 * 60 * 1000) return `${Math.floor(ageMs / 60000)}m old`;
+        if (ageMs < 24 * 60 * 60 * 1000) return `${Math.floor(ageMs / 3600000)}h old`;
+        return `${Math.floor(ageMs / 86400000)}d old`;
+    }
+
+    formatStatValue(value, fallback = 'N/A') {
+        return value === null || value === undefined || value === '' ? fallback : String(value);
+    }
+
     async getPlayerHomeRuns(playerId) {
-        const total = await this.getPlayerHomeRunTotal(playerId);
-        return total === null ? 0 : total;
+        return this.getPlayerHomeRunTotal(playerId);
     }
 
     async getPlayerHomeRunTotal(playerId) {
         const stats = await this.getPlayerStats(playerId);
-        return stats ? parseInt(stats.homeRuns) || 0 : null;
+        if (!stats || stats.homeRuns === null || stats.homeRuns === undefined) {
+            return null;
+        }
+        const total = Number.parseInt(stats.homeRuns, 10);
+        return Number.isInteger(total) && total >= 0 ? total : null;
     }
 
-    async getRecentHomeRunDetails(playerId, newHomeRunCount = 1) {
+    async getPlayerGameLog(playerId, { force = false } = {}) {
+        const cacheKey = `${this.currentSeason}:${playerId}`;
+        const cached = this.gameLogCache.get(cacheKey);
+        if (!force && cached && cached.expiresAt > this.clock().getTime()) {
+            return cached.promise;
+        }
+        const promise = this.httpGet(
+            `https://statsapi.mlb.com/api/v1/people/${playerId}/stats?stats=gameLog&season=${this.currentSeason}&group=hitting&gameType=R`
+        ).then(response => this.getStatsSplits(response, `game log for ${playerId}`));
+        this.gameLogCache.set(cacheKey, {
+            expiresAt: this.clock().getTime() + this.gameLogCacheTtlMs,
+            promise
+        });
         try {
-            // Get player's game log without limit
-            const gamesResponse = await axios.get(
-                `https://statsapi.mlb.com/api/v1/people/${playerId}/stats?stats=gameLog&season=${this.currentSeason}&group=hitting&gameType=R`
-            );
-            
-            this.log(`Successfully fetched game log for player ${playerId}`);
-            
-            if (!gamesResponse.data.stats || !gamesResponse.data.stats[0] || !gamesResponse.data.stats[0].splits) {
-                return this.createFallbackHomeRunDetails(newHomeRunCount, playerId);
-            }
-
-            // Sort games descending by date and filter for games with HRs
-            const hrGames = gamesResponse.data.stats[0].splits
-                .filter(game => game.stat.homeRuns > 0)
-                .sort((a, b) => new Date(b.date) - new Date(a.date));
-
-            if (hrGames.length === 0) {
-                return this.createFallbackHomeRunDetails(newHomeRunCount, playerId);
-            }
-
-            // Process the most recent HR game(s)
-            const detailsList = [];
-            let homeRunsFound = 0;
-            
-            for (let i = 0; i < hrGames.length && homeRunsFound < newHomeRunCount; i++) {
-                const game = hrGames[i];
-                const gameId = game.game?.gamePk;
-                const homeRunsInThisGame = game.stat.homeRuns;
-                
-                if (!gameId) continue;
-
-                try {
-                    // Use playByPlay endpoint
-                    const gameDetailResponse = await axios.get(
-                        `https://statsapi.mlb.com/api/v1/game/${gameId}/playByPlay`
-                    );
-                    
-                    const gameData = gameDetailResponse.data;
-                    if (!gameData.allPlays) {
-                        // Fallback to feed/live
-                        const liveFeedResponse = await axios.get(
-                            `https://statsapi.mlb.com/api/v1/game/${gameId}/feed/live`
-                        );
-                        gameData.allPlays = liveFeedResponse.data.liveData?.plays?.allPlays || [];
-                    }
-
-                    // Find all HR plays by this player in this game
-                    const plays = gameData.allPlays || [];
-                    const hrPlaysInGame = [];
-                    
-                    for (const play of plays) {
-                        if (this.isHomeRunByPlayer(play, playerId)) {
-                            const gameHomeRunIndex = hrPlaysInGame.length + 1;
-                            const identifiers = this.buildPlayIdentifiers(play, gameId, game.date, gameHomeRunIndex);
-                            const distance = this.extractDistanceFromPlay(play);
-                            const rbiInfo = this.extractRBIInfo(play);
-                            hrPlaysInGame.push({
-                                distance, 
-                                rbi: rbiInfo.rbi,
-                                rbiDescription: rbiInfo.rbiDescription,
-                                gameId,
-                                gameDate: game.date,
-                                ...identifiers
-                            });
-                        }
-                    }
-
-                    // If we found the expected number of HRs in play-by-play data
-                    if (hrPlaysInGame.length >= homeRunsInThisGame) {
-                        // Add all the home runs from this game
-                        detailsList.push(...hrPlaysInGame);
-                        homeRunsFound += hrPlaysInGame.length;
-                    } else if (hrPlaysInGame.length > 0) {
-                        // We found some but not all home runs
-                        detailsList.push(...hrPlaysInGame);
-                        homeRunsFound += hrPlaysInGame.length;
-                        
-                        // Add placeholder for missing home runs
-                        const missing = homeRunsInThisGame - hrPlaysInGame.length;
-                        for (let j = 0; j < missing && homeRunsFound < newHomeRunCount; j++) {
-                            const gameHomeRunIndex = hrPlaysInGame.length + j + 1;
-                            detailsList.push(this.createHomeRunDetail({
-                                distance: 'Not yet available',
-                                rbi: 'unknown',
-                                rbiDescription: 'HR (details pending)',
-                                detailStatus: 'pending',
-                                gameId,
-                                gameDate: game.date,
-                                gameHomeRunIndex,
-                                eventKey: `${gameId}_${game.date}_placeholder_${gameHomeRunIndex}`
-                            }));
-                            homeRunsFound++;
-                        }
-                    } else {
-                        // No play-by-play data found, add placeholders
-                        for (let j = 0; j < homeRunsInThisGame && homeRunsFound < newHomeRunCount; j++) {
-                            const gameHomeRunIndex = j + 1;
-                            detailsList.push(this.createHomeRunDetail({
-                                distance: 'Not yet available',
-                                rbi: 'unknown',
-                                rbiDescription: 'HR (details pending)',
-                                detailStatus: 'pending',
-                                gameId,
-                                gameDate: game.date,
-                                gameHomeRunIndex,
-                                eventKey: `${gameId}_${game.date}_placeholder_${gameHomeRunIndex}`
-                            }));
-                            homeRunsFound++;
-                        }
-                    }
-
-                    // Statcast fallback for missing details
-                    for (let j = 0; j < detailsList.length; j++) {
-                        if (detailsList[j].distance === "Not yet available" || detailsList[j].rbi === "unknown") {
-                            const statcastDetails = await this.getHomeRunDetailsFromStatcast(
-                                playerId,
-                                detailsList[j].gameId,
-                                detailsList[j].gameHomeRunIndex || 1
-                            );
-                            if (statcastDetails) {
-                                detailsList[j] = { ...detailsList[j], ...statcastDetails };
-                            }
-                        }
-                    }
-                } catch (gameError) {
-                    this.log(`Error fetching game ${gameId} details: ${gameError.message}`);
-                    // Add placeholders for this game's home runs
-                    for (let j = 0; j < homeRunsInThisGame && homeRunsFound < newHomeRunCount; j++) {
-                        const gameHomeRunIndex = j + 1;
-                        detailsList.push(this.createHomeRunDetail({
-                            distance: 'Not yet available',
-                            rbi: 'unknown',
-                            rbiDescription: 'HR (details pending)',
-                            detailStatus: 'pending',
-                            gameId,
-                            gameDate: game.date,
-                            gameHomeRunIndex,
-                            eventKey: `${gameId}_${game.date}_placeholder_${gameHomeRunIndex}`
-                        }));
-                        homeRunsFound++;
-                    }
-                }
-            }
-            
-            // Return list of details for the new home runs
-            return detailsList.length > 0
-                ? this.sortHomeRunDetailsChronologically(detailsList)
-                : this.createFallbackHomeRunDetails(newHomeRunCount, playerId);
+            return await promise;
         } catch (error) {
-            this.log(`Error fetching home run details: ${error.message}`);
-            return this.createFallbackHomeRunDetails(newHomeRunCount, playerId);
+            if (this.gameLogCache.get(cacheKey)?.promise === promise) {
+                this.gameLogCache.delete(cacheKey);
+            }
+            throw error;
         }
     }
 
-    // Updated helper method to check if a play is a home run
+    async getGamePlays(gameId, { force = false } = {}) {
+        const cacheKey = String(gameId);
+        const cached = this.playByPlayCache.get(cacheKey);
+        if (!force && cached && cached.expiresAt > this.clock().getTime()) {
+            return cached.promise;
+        }
+        const promise = this.httpGet(
+            `https://statsapi.mlb.com/api/v1/game/${gameId}/playByPlay`
+        ).then(response => this.getAllPlays(response, `play-by-play for game ${gameId}`));
+        this.playByPlayCache.set(cacheKey, {
+            expiresAt: this.clock().getTime() + this.playByPlayCacheTtlMs,
+            promise
+        });
+        try {
+            return await promise;
+        } catch (error) {
+            if (this.playByPlayCache.get(cacheKey)?.promise === promise) {
+                this.playByPlayCache.delete(cacheKey);
+            }
+            throw error;
+        }
+    }
+
+    createPendingHomeRunDetail(playerId, gameId, gameDate, gameHomeRunIndex) {
+        const detail = this.createHomeRunDetail({
+            playerId: String(playerId),
+            season: this.currentSeason,
+            distance: 'Not yet available',
+            rbi: null,
+            rbiDescription: 'HR (details pending)',
+            detailStatus: 'pending',
+            gameId,
+            gameDate,
+            gameHomeRunIndex
+        });
+        detail.eventKey = this.buildHomeRunId(detail, playerId);
+        return detail;
+    }
+
+    async getRecentHomeRunDetails(
+        playerId,
+        requestedHomeRunCount = 1,
+        { force = false } = {}
+    ) {
+        const targetCount = Math.max(0, Number.parseInt(requestedHomeRunCount, 10) || 0);
+        if (targetCount === 0) return [];
+        const playerData = this.players[String(playerId)];
+
+        try {
+            const splits = await this.getPlayerGameLog(playerId, { force });
+            const hrGames = splits
+                .filter(game => {
+                    const count = Number.parseInt(game?.stat?.homeRuns, 10);
+                    return Number.isInteger(count) && count > 0 && game?.game?.gamePk;
+                })
+                .sort((left, right) =>
+                    safeDateTimestamp(right.date) - safeDateTimestamp(left.date) ||
+                    Number(right.game.gamePk) - Number(left.game.gamePk)
+                );
+
+            const detailsList = [];
+            let accountedFor = 0;
+            for (const game of hrGames) {
+                if (accountedFor >= targetCount) break;
+                const gameId = String(game.game.gamePk);
+                const gameDateTime = game.game?.gameDate || game.date;
+                const gameNumber = Number.parseInt(
+                    game.game?.gameNumber ?? game.game?.doubleHeader ?? game.gameNumber,
+                    10
+                );
+                const gameHomeRunCount = Number.parseInt(game.stat.homeRuns, 10);
+                const expectedCount = Math.min(
+                    gameHomeRunCount,
+                    targetCount - accountedFor
+                );
+                const firstSelectedSlot = gameHomeRunCount - expectedCount + 1;
+                const selectedSlots = Array.from(
+                    { length: expectedCount },
+                    (_, index) => firstSelectedSlot + index
+                );
+                let matchingPlays = [];
+                const cachedGameEvents = (force
+                    ? []
+                    : Object.values(playerData?.homeRunEvents || {}))
+                    .filter(detail =>
+                        String(detail?.gameId) === gameId &&
+                        detail?.detailStatus === 'confirmed' &&
+                        Number.isInteger(detail?.gameHomeRunIndex)
+                    )
+                    .sort((left, right) => left.gameHomeRunIndex - right.gameHomeRunIndex);
+                const cachedBySlot = new Map(
+                    cachedGameEvents.map(detail => [detail.gameHomeRunIndex, detail])
+                );
+                const cacheCoversSelection = selectedSlots.every(slot => cachedBySlot.has(slot));
+                if (!cacheCoversSelection) {
+                    try {
+                        const plays = await this.getGamePlays(gameId, { force });
+                        matchingPlays = plays
+                            .filter(play => this.isHomeRunByPlayer(play, playerId))
+                            .sort((left, right) =>
+                                (Number.isInteger(left.about?.atBatIndex) ? left.about.atBatIndex : Number.MAX_SAFE_INTEGER) -
+                                (Number.isInteger(right.about?.atBatIndex) ? right.about.atBatIndex : Number.MAX_SAFE_INTEGER)
+                            );
+                        if (matchingPlays.length !== gameHomeRunCount) {
+                            this.logEvent('warn', 'partial_play_by_play_home_run_set', {
+                                playerId,
+                                gameId,
+                                expected: gameHomeRunCount,
+                                received: matchingPlays.length
+                            });
+                            matchingPlays = [];
+                        }
+                    } catch (error) {
+                        this.log(`Could not retrieve plays for game ${gameId}, player ${playerId}: ${error.message}`);
+                    }
+                }
+
+                for (const slot of selectedSlots) {
+                    const cachedDetail = cachedBySlot.get(slot) || null;
+                    if (cachedDetail) {
+                        detailsList.push({ ...cachedDetail });
+                        continue;
+                    }
+                    const play = matchingPlays[slot - 1];
+                    if (!play) {
+                        detailsList.push(this.createPendingHomeRunDetail(playerId, gameId, gameDateTime, slot));
+                        continue;
+                    }
+                    const rbiInfo = this.extractRBIInfo(play);
+                    const detail = this.createHomeRunDetail({
+                        playerId: String(playerId),
+                        season: this.currentSeason,
+                        distance: this.extractDistanceFromPlay(play),
+                        rbi: rbiInfo.rbi,
+                        rbiDescription: rbiInfo.rbiDescription,
+                        gameId,
+                        gameDate: gameDateTime,
+                        gameNumber: Number.isInteger(gameNumber) ? gameNumber : null,
+                        ...this.buildPlayIdentifiers(play, gameId, gameDateTime, slot, playerId)
+                    });
+                    detailsList.push(detail);
+                }
+                accountedFor += expectedCount;
+            }
+
+            const pendingIndexes = detailsList
+                .map((detail, index) => ({ detail, index }))
+                .filter(({ detail }) =>
+                    detail.distance === 'Not yet available' || detail.rbi === null
+                );
+            for (const { detail, index } of pendingIndexes) {
+                const statcastDetails = await this.getHomeRunDetailsFromStatcast(
+                    playerId,
+                    detail.gameId,
+                    detail.gameHomeRunIndex
+                );
+                if (statcastDetails) {
+                    detailsList[index] = { ...detail, ...statcastDetails };
+                }
+            }
+
+            if (detailsList.length < targetCount) {
+                return this.createFallbackHomeRunDetails(targetCount, playerId);
+            }
+            return this.sortHomeRunDetailsChronologically(detailsList);
+        } catch (error) {
+            this.log(`Error fetching home run details for player ${playerId}: ${error.message}`);
+            return this.createFallbackHomeRunDetails(targetCount, playerId);
+        }
+    }
+
     isHomeRunByPlayer(play, playerId) {
-        // Check if it's the right player
         const batterId = play.matchup?.batter?.id || play.result?.batter?.id;
         if (batterId?.toString() !== playerId) {
             return false;
         }
-        
-        // Check multiple fields for home run indication
-        const isHomeRun = 
-            play.result?.event === 'Home Run' || 
-            play.result?.eventType === 'home_run' ||
-            play.result?.type === 'home_run' ||
-            (play.result?.description && play.result.description.toLowerCase().includes('homers')) ||
-            (play.result?.description && play.result.description.toLowerCase().includes('home run'));
-        
-        return isHomeRun;
+
+        const eventType = String(play.result?.eventType || '').trim().toLowerCase();
+        const event = String(play.result?.event || '').trim().toLowerCase();
+        const resultType = String(play.result?.type || '').trim().toLowerCase();
+        if (eventType) return eventType === 'home_run';
+        if (event) return event === 'home run';
+        return resultType === 'home_run';
     }
 
-    // CRITICAL FIX: Updated method to extract distance from the correct location
     extractDistanceFromPlay(play) {
-        let distance = "Distance not available";
-        
-        // Priority 1: Check playEvents array (THIS IS WHERE THE DATA ACTUALLY IS!)
+        const formatDistance = value => {
+            if (value === null || value === undefined || value === '') return null;
+            const numeric = Number(value);
+            return Number.isFinite(numeric) && numeric >= 100 && numeric <= 600
+                ? `${Math.round(numeric)} ft`
+                : null;
+        };
+
         if (play.playEvents && Array.isArray(play.playEvents)) {
             for (const event of play.playEvents) {
-                if (event.hitData && event.hitData.totalDistance) {
-                    distance = `${Math.round(event.hitData.totalDistance)} ft`;
-                    this.log(`Found distance in playEvents: ${distance}`);
-                    break;
-                }
+                const distance = formatDistance(event?.hitData?.totalDistance);
+                if (distance) return distance;
             }
         }
-        
-        // Priority 2: Check hitData at play level (rarely populated)
-        if (distance === "Distance not available" && play.hitData) {
-            if (play.hitData.totalDistance) {
-                distance = `${Math.round(play.hitData.totalDistance)} ft`;
-                this.log(`Found distance in play.hitData: ${distance}`);
-            } else if (play.hitData.launchDistance) {
-                distance = `${Math.round(play.hitData.launchDistance)} ft`;
-                this.log(`Found launch distance: ${distance}`);
-            }
+
+        if (play.hitData) {
+            const distance =
+                formatDistance(play.hitData.totalDistance) ||
+                formatDistance(play.hitData.launchDistance);
+            if (distance) return distance;
         }
-        
-        // Priority 3: Parse from description as last resort
-        if (distance === "Distance not available" && play.result?.description) {
+
+        if (play.result?.description) {
             const patterns = [
                 /(\d{3,4})\s*(?:feet|foot|ft)/i,
                 /\((\d{3,4})\s*ft\)/i,
                 /(\d{3,4})-foot/i,
                 /traveled\s*(\d{3,4})/i
             ];
-            
+
             for (const pattern of patterns) {
                 const match = play.result.description.match(pattern);
-                if (match && match[1]) {
-                    distance = `${match[1]} ft`;
-                    this.log(`Found distance in description: ${distance}`);
-                    break;
-                }
+                const distance = formatDistance(match?.[1]);
+                if (distance) return distance;
             }
         }
-        
-        return distance;
+
+        return 'Distance not available';
     }
 
-    // Updated RBI extraction with better detection
     extractRBIInfo(play) {
-        let rbi = 1; // Default to solo HR
-        let rbiDescription = "Solo HR";
-        
-        // Priority 1: Check result.rbi field
-        if (play.result && typeof play.result.rbi === 'number' && play.result.rbi > 0) {
-            rbi = play.result.rbi;
-            this.log(`Found RBI in result.rbi: ${rbi}`);
-        } 
-        // Priority 2: Check runners who scored
-        else if (play.runners && Array.isArray(play.runners)) {
-            // Count runners who scored (including the batter)
-            const scoringRunners = play.runners.filter(runner => 
-                runner.movement && 
-                (runner.movement.end === 'score' || runner.movement.outBase === 'score')
+        let rbi = Number.parseInt(play?.result?.rbi, 10);
+        if (!Number.isInteger(rbi) || rbi < 1 || rbi > 4) {
+            rbi = null;
+        }
+
+        if (rbi === null && Array.isArray(play?.runners)) {
+            const scoringRunnerIds = new Set(
+                play.runners
+                    .filter(runner => runner?.movement?.end === 'score')
+                    .map(runner => String(runner?.details?.runner?.id || runner?.details?.runner?.fullName || ''))
+                    .filter(Boolean)
             );
-            
-            if (scoringRunners.length > 0) {
-                rbi = scoringRunners.length;
-                this.log(`Found ${rbi} scoring runners`);
-            } else {
-                this.log(`No scoring runners found`);
+            if (scoringRunnerIds.size >= 1 && scoringRunnerIds.size <= 4) {
+                rbi = scoringRunnerIds.size;
             }
         }
-        // Priority 3: Parse from description
-        else if (play.result?.description) {
+
+        if (rbi === null && play?.result?.description) {
             const desc = play.result.description.toLowerCase();
-            
-            // Check for explicit mentions
             if (desc.includes('grand slam')) {
                 rbi = 4;
-            } else if (desc.includes('3-run') || desc.includes('three-run')) {
+            } else if (/\b(?:3|three)[ -]run\b/.test(desc)) {
                 rbi = 3;
-            } else if (desc.includes('2-run') || desc.includes('two-run')) {
+            } else if (/\b(?:2|two)[ -]run\b/.test(desc)) {
                 rbi = 2;
-            } else if (desc.includes('solo')) {
+            } else if (/\bsolo\b/.test(desc)) {
                 rbi = 1;
             } else {
-                // Count "scores" mentions
-                const scoreMatches = desc.match(/scores?/gi);
-                if (scoreMatches) {
-                    // The batter scores too, so count should include them
-                    rbi = Math.max(1, scoreMatches.length);
-                }
+                const scored = desc.match(/\b(?:scores|score)\b/gi)?.length;
+                rbi = Number.isInteger(scored)
+                    ? Math.min(4, 1 + scored)
+                    : 1;
             }
-            this.log(`Parsed RBI from description: ${rbi}`);
-        } else {
-            this.log(`No RBI info found, defaulting to 1`);
         }
-        
-        // Set description based on RBI count
-        switch(rbi) {
-            case 1:
-                rbiDescription = "Solo HR";
-                break;
-            case 2:
-                rbiDescription = "2-run HR";
-                break;
-            case 3:
-                rbiDescription = "3-run HR";
-                break;
-            case 4:
-                rbiDescription = "Grand Slam!";
-                break;
-            default:
-                rbiDescription = `${rbi}-run HR`;
-        }
-        
-        return { rbi, rbiDescription };
-    }
 
-    // Add this helper method to count runners from description
-    countRunnersFromDescription(description) {
-        let count = 0;
-        
-        // Look for phrases like "scores", "score", etc.
-        const scoreMatches = description.match(/(\w+)\s+scores?/gi);
-        if (scoreMatches) {
-            // Subtract 1 because the batter's name will be included
-            count = scoreMatches.length - 1;
-        }
-        
-        // Look for specific runner mentions
-        if (description.includes('scores from third') || description.includes('scores from 3rd')) count++;
-        if (description.includes('scores from second') || description.includes('scores from 2nd')) count++;
-        if (description.includes('scores from first') || description.includes('scores from 1st')) count++;
-        
-        return Math.max(0, count);
-    }
-
-        async getHomeRunDetailsFromAlternativeAPI(playerId) {
-        try {
-            const response = await axios.get(
-                `https://statsapi.mlb.com/api/v1/people/${playerId}/stats?stats=gameLog&season=${this.currentSeason}&group=hitting&gameType=R`
-            );
-            
-            if (response.data.stats && response.data.stats[0] && response.data.stats[0].splits) {
-                // Look for the most recent game with home runs
-                const recentGames = response.data.stats[0].splits
-                    .filter(game => game.stat.homeRuns > 0)
-                    .sort((a, b) => new Date(b.date) - new Date(a.date));
-                
-                if (recentGames.length > 0) {
-                    const mostRecentHRGame = recentGames[0];
-                    const gameId = mostRecentHRGame.game?.gamePk;
-                    
-                    if (gameId) {
-                        try {
-                            // Try playByPlay endpoint first
-                            const gameDetailResponse = await axios.get(
-                                `https://statsapi.mlb.com/api/v1/game/${gameId}/playByPlay`
-                            );
-                            
-                            const plays = gameDetailResponse.data.allPlays || [];
-                            
-                            // Find home runs by this player
-                            for (const play of plays.reverse()) {
-                                if (this.isHomeRunByPlayer(play, playerId)) {
-                                    const distance = this.extractDistanceFromPlay(play);
-                                    const rbiInfo = this.extractRBIInfo(play);
-                                    
-                                    return {
-                                        distance: distance,
-                                        rbi: rbiInfo.rbi,
-                                        rbiDescription: rbiInfo.rbiDescription,
-                                        gameId: gameId
-                                    };
-                                }
-                            }
-                        } catch (detailError) {
-                            this.log(`Could not get detailed game data: ${detailError.message}`);
-                        }
-                    }
-                    
-                    // Fallback: details pending
-                    return {
-                        distance: "Not yet available",
-                        rbi: "unknown",
-                        rbiDescription: "HR (details pending)",
-                        gameId: gameId
-                    };
-                }
-            }
-            
-            return { distance: "Distance not available", rbi: 1, rbiDescription: "Solo HR" };
-        } catch (error) {
-            this.log(`Error in alternative HR details API: ${error.message}`);
-            return { distance: "Distance not available", rbi: 1, rbiDescription: "Solo HR" };
-        }
+        return { rbi, rbiDescription: this.getRbiDescription(rbi) };
     }
 
     getRbiDescription(rbi) {
-        if (rbi === 1) return "Solo HR";
-        if (rbi === 2) return "2-run HR";
-        if (rbi === 3) return "3-run HR";
-        if (rbi === 4) return "Grand Slam!";
-        return "Solo HR"; // Default fallback
+        const parsedRbi = Number.parseInt(rbi, 10);
+        if (parsedRbi === 1) return 'Solo HR';
+        if (parsedRbi === 2) return '2-run HR';
+        if (parsedRbi === 3) return '3-run HR';
+        if (parsedRbi === 4) return 'Grand Slam!';
+        return 'HR (RBI pending)';
     }
 
-    async getHomeRunDetailsFromStatcast(playerId, gameId = null, gameHomeRunIndex = 1) {
-        try {
-            let url = `https://baseballsavant.mlb.com/statcast_search/csv?all=true&hfPT=&hfAB=home%5C.run%7C&hfBBT=&hfPR=&hfZ=&stadium=&hfBBL=&hfNewZones=&hfGT=R%7C&hfC=&hfSea=${this.currentSeason}%7C&hfSit=&player_type=batter&hfOuts=&opponent=&pitcher_throws=&batter_stands=&hfSA=&game_date_gt=&game_date_lt=&hfInning=&hfRO=&team=&position=&hfOutfieldDirection=&hfInn=&min_pitches=0&min_results=0&min_pas=0&sort_col=game_date&player_event_sort=game_date&sort_order=desc&type=details&player_id=${playerId}`;
-            
-            if (gameId) {
-                url += `&game_pk=${gameId}`;
-            }
-            
-            const response = await axios.get(url);
-            
+    buildSavantHomeRunUrl(playerId, gameId = null) {
+        let url = `https://baseballsavant.mlb.com/statcast_search/csv?all=true&hfAB=home%5C.run%7C&hfGT=R%7C&hfSea=${this.currentSeason}%7C&player_type=batter&type=details&batters_lookup%5B%5D=${encodeURIComponent(playerId)}`;
+        if (gameId) {
+            url += `&game_pk=${encodeURIComponent(gameId)}`;
+        }
+        return url;
+    }
+
+    async getSavantHomeRunRows(playerId, gameId = null) {
+        const cacheKey = `savant-csv:${this.currentSeason}:${playerId}:${gameId || 'season'}`;
+        const cached = this.statcastCache.get(cacheKey);
+        if (cached && cached.expiresAt > this.clock().getTime()) {
+            return cached.promise;
+        }
+        const promise = this.httpGet(
+            this.buildSavantHomeRunUrl(playerId, gameId),
+            { responseType: 'text' }
+        ).then(response => {
             const rows = parse(response.data, {
                 columns: true,
                 skip_empty_lines: true
             });
-
-            if (!Array.isArray(rows) || rows.length === 0) {
-                return null;
+            if (!Array.isArray(rows)) {
+                throw new Error('Savant CSV did not parse to rows');
             }
-            
-            let matchingHomeRunCount = 0;
-            for (const row of rows) {
-                if (row.events === 'home_run' &&
-                    (!gameId || row.game_pk === gameId.toString())) {
-                    matchingHomeRunCount++;
-                    if (matchingHomeRunCount < gameHomeRunIndex) {
-                        continue;
-                    }
-
-                    const distance = row.hit_distance_sc && row.hit_distance_sc !== 'null'
-                        ? `${Math.round(parseFloat(row.hit_distance_sc))} ft`
-                        : 'Distance not available';
-                    const rbi = parseInt(row.rbi, 10) || 1;
-                    const rbiDescription = this.getRbiDescription(rbi);
-                    
-                    return { distance, rbi, rbiDescription };
-                }
+            return rows
+                .filter(row =>
+                    row?.events === 'home_run' &&
+                    String(row.batter) === String(playerId) &&
+                    (!gameId || String(row.game_pk) === String(gameId))
+                )
+                .sort((left, right) =>
+                    safeDateTimestamp(left.game_date) - safeDateTimestamp(right.game_date) ||
+                    (Number.parseInt(left.at_bat_number, 10) || Number.MAX_SAFE_INTEGER) -
+                        (Number.parseInt(right.at_bat_number, 10) || Number.MAX_SAFE_INTEGER)
+                );
+        });
+        this.statcastCache.set(cacheKey, {
+            expiresAt: this.clock().getTime() + this.statcastCacheTtlMs,
+            promise
+        });
+        try {
+            return await promise;
+        } catch (error) {
+            if (this.statcastCache.get(cacheKey)?.promise === promise) {
+                this.statcastCache.delete(cacheKey);
             }
-            
+            throw error;
+        }
+    }
+
+    selectSavantHomeRunRow(rows, hrDetail = {}) {
+        if (!Array.isArray(rows) || rows.length === 0) return null;
+        if (Number.isInteger(hrDetail.atBatIndex)) {
+            const expectedAtBatNumber = hrDetail.atBatIndex + 1;
+            return rows.find(
+                row => Number.parseInt(row.at_bat_number, 10) === expectedAtBatNumber
+            ) || null;
+        }
+        const ordinal = Number.parseInt(hrDetail.gameHomeRunIndex, 10);
+        return Number.isInteger(ordinal) && ordinal >= 1 ? rows[ordinal - 1] || null : null;
+    }
+
+    extractSavantRbi(row) {
+        const preScore = Number(row?.bat_score);
+        const postScore = Number(row?.post_bat_score);
+        const scoreDelta = postScore - preScore;
+        if (Number.isInteger(scoreDelta) && scoreDelta >= 1 && scoreDelta <= 4) {
+            return scoreDelta;
+        }
+        const baseValues = [row?.on_1b, row?.on_2b, row?.on_3b];
+        if (!baseValues.some(value => value !== undefined)) return null;
+        const occupiedBases = baseValues.filter(value => {
+            const normalized = String(value ?? '').trim().toLowerCase();
+            return normalized && !['0', 'null', 'nan', 'none'].includes(normalized);
+        }).length;
+        return 1 + occupiedBases;
+    }
+
+    async getHomeRunDetailsFromStatcast(playerId, gameId = null, gameHomeRunIndex = 1) {
+        const cacheKey = `${this.currentSeason}:${playerId}:${gameId || 'any'}:${gameHomeRunIndex}`;
+        const cached = this.statcastCache.get(cacheKey);
+        if (cached && cached.expiresAt > this.clock().getTime()) {
+            return cached.promise;
+        }
+        const promise = this.fetchHomeRunDetailsFromStatcast(playerId, gameId, gameHomeRunIndex);
+        this.statcastCache.set(cacheKey, {
+            expiresAt: this.clock().getTime() + this.statcastCacheTtlMs,
+            promise
+        });
+        return promise;
+    }
+
+    async fetchHomeRunDetailsFromStatcast(playerId, gameId = null, gameHomeRunIndex = 1) {
+        try {
+            const rows = await this.getSavantHomeRunRows(playerId, gameId);
+            const row = this.selectSavantHomeRunRow(rows, { gameHomeRunIndex });
+            if (row) {
+                const parsedDistance = Number.parseFloat(row.hit_distance_sc ?? row.hit_distance);
+                const distance = Number.isFinite(parsedDistance) &&
+                    parsedDistance >= 100 &&
+                    parsedDistance <= 600
+                    ? `${Math.round(parsedDistance)} ft`
+                    : 'Distance not available';
+                const rbi = this.extractSavantRbi(row);
+                return { distance, rbi, rbiDescription: this.getRbiDescription(rbi) };
+            }
             return null;
         } catch (error) {
             this.log(`Error fetching Statcast data: ${error.message}`);
@@ -872,134 +3449,358 @@ class BaseballBot {
         }
     }
 
-    async checkForNewHomeRuns() {
+    async checkForNewHomeRuns({ force = false } = {}) {
         if (this.checkInProgress) {
-            this.log('Home run check already in progress; reusing the active run');
+            this.logEvent('info', 'poll_reused', {});
             return this.checkInProgress;
         }
 
         this.checkInProgress = (async () => {
-            this.lastCheckTime = new Date();
-            this.log(`Starting home run check at ${this.lastCheckTime.toISOString()}`);
-            
-            let alertsSent = 0;
-            
+            await this.ensureActiveSeason();
+            this.lastCheckTime = this.clock();
+            this.metrics.checksStarted++;
+            const result = {
+                startedAt: this.lastCheckTime.toISOString(),
+                force,
+                playersChecked: 0,
+                playersFailed: 0,
+                detected: 0,
+                alertsDelivered: 0,
+                alertFailures: 0,
+                enrichmentsQueued: 0
+            };
+            this.logEvent('info', 'poll_started', { force, season: this.currentSeason });
+
             for (const [playerId, playerData] of Object.entries(this.players)) {
+                if (this.shuttingDown) break;
+                const releasePlayerMutation = await this.acquireKeyedLock(
+                    this.playerMutationLocks,
+                    playerId
+                );
                 try {
                     this.ensurePlayerDeliveryState(playerData);
                     const startupCatchUpActive = this.startupCatchUpPlayerIds.has(playerId);
                     const currentHomeRuns = await this.getPlayerHomeRunTotal(playerId);
                     if (currentHomeRuns === null) {
-                        this.log(`${playerData.name}: could not confirm current HR total; keeping existing checkpoint`);
+                        result.playersFailed++;
+                        this.logEvent('warn', 'player_total_unavailable', {
+                            playerId,
+                            player: playerData.name,
+                            checkpoint: playerData.lastCheckedHR
+                        });
+                        continue;
+                    }
+                    result.playersChecked++;
+
+                    if (!playerData.checkpointInitialized) {
+                        const baselineDetails =
+                            await this.getStableHomeRunInventory(
+                                playerId,
+                                currentHomeRuns
+                            );
+                        if (!baselineDetails ||
+                            !this.captureBaselineInventory(
+                            playerId,
+                            playerData,
+                            baselineDetails,
+                            currentHomeRuns
+                        )) {
+                            this.logEvent('warn', 'player_baseline_deferred', {
+                                playerId,
+                                player: playerData.name,
+                                homeRuns: currentHomeRuns
+                            });
+                            continue;
+                        }
+                        this.captureAuthoritativeInventory(
+                            playerId,
+                            playerData,
+                            baselineDetails,
+                            currentHomeRuns
+                        );
+                        playerData.lastCheckedHR = currentHomeRuns;
+                        playerData.checkpointInitialized = true;
+                        playerData.lowerTotalObservation = null;
+                        this.saveState({ throwOnError: true });
+                        this.logEvent('info', 'player_baseline_established', {
+                            playerId,
+                            player: playerData.name,
+                            homeRuns: currentHomeRuns
+                        });
                         continue;
                     }
 
-                    const previousCheckpoint = Math.max(0, parseInt(playerData.lastCheckedHR, 10) || 0);
-                    
-                    this.log(`${playerData.name}: Current=${currentHomeRuns}, Last=${previousCheckpoint}`);
-                    
-                    if (currentHomeRuns > previousCheckpoint) {
-                        const newHomeRuns = currentHomeRuns - previousCheckpoint;
-                        this.log(`🚨 NEW HOME RUN DETECTED! ${playerData.name} went from ${previousCheckpoint} to ${currentHomeRuns} (+${newHomeRuns})`);
-                        
-                        const allHomeRunDetails = this.sortHomeRunDetailsChronologically(
-                            await this.getRecentHomeRunDetails(playerId, currentHomeRuns)
+                    const previousCheckpoint = Math.max(0, Number.parseInt(playerData.lastCheckedHR, 10) || 0);
+                    if (currentHomeRuns < previousCheckpoint) {
+                        const previousObservation = playerData.lowerTotalObservation;
+                        const observation = previousObservation?.value === currentHomeRuns
+                            ? { value: currentHomeRuns, count: previousObservation.count + 1 }
+                            : { value: currentHomeRuns, count: 1 };
+                        playerData.lowerTotalObservation = observation;
+                        if (observation.count >= 2) {
+                            const correctionReconciled =
+                                await this.reconcileDownwardCorrection(
+                                playerId,
+                                playerData,
+                                currentHomeRuns
+                            );
+                            if (!correctionReconciled) {
+                                this.logEvent('warn', 'official_total_correction_deferred', {
+                                    playerId,
+                                    player: playerData.name,
+                                    previousCheckpoint,
+                                    correctedTotal: currentHomeRuns
+                                });
+                                this.saveState({ throwOnError: true });
+                                continue;
+                            }
+                            playerData.lastCheckedHR = currentHomeRuns;
+                            playerData.lowerTotalObservation = null;
+                            this.logEvent('warn', 'official_total_correction_applied', {
+                                playerId,
+                                player: playerData.name,
+                                previousCheckpoint,
+                                correctedTotal: currentHomeRuns
+                            });
+                        } else {
+                            this.logEvent('warn', 'lower_total_waiting_for_confirmation', {
+                                playerId,
+                                player: playerData.name,
+                                previousCheckpoint,
+                                observedTotal: currentHomeRuns
+                            });
+                        }
+                        this.saveState({ throwOnError: true });
+                        continue;
+                    }
+                    playerData.lowerTotalObservation = null;
+
+                    if (currentHomeRuns === previousCheckpoint &&
+                        !playerData.baselineSnapshotInitialized) {
+                        const baselineDetails =
+                            await this.getStableHomeRunInventory(
+                                playerId,
+                                currentHomeRuns
+                            );
+                        if (baselineDetails && this.captureBaselineInventory(
+                            playerId,
+                            playerData,
+                            baselineDetails,
+                            currentHomeRuns
+                        )) {
+                            this.captureAuthoritativeInventory(
+                                playerId,
+                                playerData,
+                                baselineDetails,
+                                currentHomeRuns
+                            );
+                            this.saveState({ throwOnError: true });
+                            this.logEvent('info', 'baseline_identity_snapshot_captured', {
+                                playerId,
+                                homeRuns: currentHomeRuns
+                            });
+                        }
+                    }
+
+                    const authoritativeSnapshotAge = this.clock().getTime() -
+                        Date.parse(playerData.authoritativeSnapshotCapturedAt);
+                    const authoritativeDeliveryPending =
+                        playerData.authoritativeSnapshotInitialized &&
+                        [...playerData.authoritativeHomeRunIds].some(eventId =>
+                            !playerData.baselineHomeRunIds.has(eventId) &&
+                            this.getPendingChannelIdsForHomeRun(
+                                playerData,
+                                eventId
+                            ).length > 0
                         );
-                        
-                        let unseenHomeRuns = [];
+                    const inventoryRefreshDue =
+                        currentHomeRuns === previousCheckpoint &&
+                        playerData.authoritativeSnapshotInitialized &&
+                        (
+                            force ||
+                            authoritativeDeliveryPending ||
+                            !Number.isFinite(authoritativeSnapshotAge) ||
+                            authoritativeSnapshotAge >=
+                                this.authoritativeReconciliationIntervalMs
+                        );
+
+                    if (currentHomeRuns > previousCheckpoint || inventoryRefreshDue) {
+                        const allHomeRunDetails = this.sortHomeRunDetailsChronologically(
+                            await this.getRecentHomeRunDetails(
+                                playerId,
+                                currentHomeRuns,
+                                { force: true }
+                            )
+                        );
+                        const confirmedSnapshotTotal = await this.getPlayerHomeRunTotal(playerId);
+                        if (confirmedSnapshotTotal === null || confirmedSnapshotTotal !== currentHomeRuns) {
+                            this.logEvent('warn', 'aggregate_detail_snapshot_changed', {
+                                playerId,
+                                originalTotal: currentHomeRuns,
+                                confirmedTotal: confirmedSnapshotTotal
+                            });
+                            continue;
+                        }
+                        if (!playerData.baselineSnapshotInitialized &&
+                            !this.captureBaselineInventory(
+                                playerId,
+                                playerData,
+                                allHomeRunDetails,
+                                previousCheckpoint
+                            )) {
+                            this.logEvent('warn', 'baseline_identity_snapshot_unavailable', {
+                                playerId,
+                                checkpoint: previousCheckpoint,
+                                currentHomeRuns
+                            });
+                            continue;
+                        }
+                        const previousAuthoritativeIds = new Set(
+                            playerData.authoritativeHomeRunIds
+                        );
+                        const hadAuthoritativeSnapshot =
+                            playerData.authoritativeSnapshotInitialized;
+                        const reconciledInventory =
+                            await this.reconcileAuthoritativeInventory(
+                                playerId,
+                                playerData,
+                                allHomeRunDetails,
+                                currentHomeRuns,
+                                {
+                                    requireCorrectionConfirmation:
+                                        true
+                                }
+                            );
+                        if (!reconciledInventory) {
+                            continue;
+                        }
+                        const reconciledIdSet =
+                            new Set(reconciledInventory);
+                        const identityCorrectionApplied =
+                            hadAuthoritativeSnapshot &&
+                            [...previousAuthoritativeIds].some(
+                                eventId => !reconciledIdSet.has(eventId)
+                            );
+
+                        const unseenHomeRuns = [];
                         for (let index = 0; index < allHomeRunDetails.length; index++) {
                             const hrDetail = allHomeRunDetails[index];
-                            const hrId = this.buildHomeRunId(hrDetail);
+                            const hrId = this.reconcileHomeRunAliases(playerId, playerData, hrDetail);
                             const totalHomeRuns = index + 1;
-
-                            if (totalHomeRuns <= previousCheckpoint) {
+                            if (playerData.baselineHomeRunIds.has(hrId) ||
+                                this.pendingNotifications.has(hrId)) {
                                 continue;
                             }
-
-                            // Skip HRs already being processed by a pending notification
-                            if (this.pendingNotifications.has(hrId)) {
-                                continue;
-                            }
-
                             const pendingChannelIds = this.getPendingChannelIdsForHomeRun(playerData, hrId);
                             if (pendingChannelIds.length > 0) {
-                                unseenHomeRuns.push({
-                                    hrDetail,
-                                    hrId,
-                                    pendingChannelIds,
-                                    totalHomeRuns
-                                });
+                                unseenHomeRuns.push({ hrDetail, hrId, pendingChannelIds, totalHomeRuns });
                             }
                         }
 
                         let checkpointFloor = previousCheckpoint;
-                        if (startupCatchUpActive && unseenHomeRuns.length > 1) {
-                            const latestUnseenHomeRun = unseenHomeRuns[unseenHomeRuns.length - 1];
-                            const skippedHomeRuns = unseenHomeRuns.slice(0, -1);
 
-                            for (const { hrId } of skippedHomeRuns) {
-                                this.markHomeRunSentToChannels(playerData, hrId, this.channelIds);
-                            }
-
-                            checkpointFloor = Math.max(
-                                checkpointFloor,
-                                latestUnseenHomeRun.totalHomeRuns - 1
-                            );
-                            unseenHomeRuns = [latestUnseenHomeRun];
-
-                            this.log(`${playerData.name}: startup catch-up skipped ${skippedHomeRuns.length} older missed home run(s); keeping only HR #${latestUnseenHomeRun.totalHomeRuns}`);
-                        }
-
-                        const dispatchableHomeRuns = unseenHomeRuns.filter(({ hrDetail }) => !this.isFallbackHomeRunDetail(hrDetail));
-                        const fallbackHomeRunCount = unseenHomeRuns.length - dispatchableHomeRuns.length;
-
-                        this.log(`Found ${dispatchableHomeRuns.length} dispatchable new home runs out of ${allHomeRunDetails.length} total for ${playerData.name}`);
-                        if (fallbackHomeRunCount > 0) {
-                            this.log(`${playerData.name}: ${fallbackHomeRunCount} home run(s) are still missing game context; leaving them pending for the next check`);
-                        }
-
-                        for (const { hrDetail, hrId, pendingChannelIds, totalHomeRuns } of dispatchableHomeRuns) {
-                            // Mark as pending so subsequent check cycles don't re-dispatch
-                            this.pendingNotifications.add(hrId);
-
-                            // Fire off the wait-for-statcast-then-send flow (non-blocking)
-                            this.waitForStatcastAndSend(playerId, playerData, totalHomeRuns, hrDetail, hrId, pendingChannelIds)
-                                .then(sent => {
-                                    if (sent) alertsSent++;
-                                })
-                                .catch(err => this.log(`Notification error for ${playerData.name} HR ${hrId}: ${err.message}`))
-                                .finally(() => {
-                                    this.pendingNotifications.delete(hrId);
-                                    this.saveState();
-                                });
-                        }
-
-                        this.players[playerId].lastCheckedHR = Math.min(
-                            currentHomeRuns,
-                            this.countContiguousDeliveredHomeRuns(playerData, allHomeRunDetails, checkpointFloor)
+                        const dispatchable = unseenHomeRuns.filter(
+                            ({ hrDetail }) => !this.isFallbackHomeRunDetail(hrDetail)
                         );
-                        if (this.players[playerId].lastCheckedHR < currentHomeRuns) {
-                            this.log(`${playerData.name}: only fully delivered ${this.players[playerId].lastCheckedHR}/${currentHomeRuns} tracked home run(s); leaving the remainder pending for retry`);
+                        if (dispatchable.length > 0) {
+                            result.detected += dispatchable.length;
+                            this.metrics.detected += dispatchable.length;
+                            this.logEvent('info', 'home_runs_detected', {
+                                playerId,
+                                player: playerData.name,
+                                previousCheckpoint,
+                                currentHomeRuns,
+                                aggregateIncrease:
+                                    currentHomeRuns - previousCheckpoint,
+                                eventIdentities: dispatchable.map(({ hrId }) => hrId)
+                            });
                         }
-                        this.saveState();
+                        const missingContext = unseenHomeRuns.length - dispatchable.length;
+                        if (missingContext > 0) {
+                            this.logEvent('warn', 'home_runs_missing_game_context', {
+                                playerId,
+                                count: missingContext
+                            });
+                        }
+
+                        for (const { hrDetail, hrId, pendingChannelIds, totalHomeRuns } of dispatchable) {
+                            if (this.shuttingDown) break;
+                            this.pendingNotifications.add(hrId);
+                            try {
+                                const pendingBefore = this.pendingEnrichments.size;
+                                const delivery = await this.sendInitialAlert(
+                                    playerId,
+                                    playerData,
+                                    totalHomeRuns,
+                                    hrDetail,
+                                    hrId,
+                                    pendingChannelIds
+                                );
+                                result.alertsDelivered += delivery.successChannelIds.length;
+                                result.alertFailures += delivery.failedChannelIds.length;
+                                if (this.pendingEnrichments.size > pendingBefore) result.enrichmentsQueued++;
+                            } finally {
+                                this.pendingNotifications.delete(hrId);
+                            }
+                        }
+
+                        playerData.lastCheckedHR = Math.min(
+                            currentHomeRuns,
+                            Math.max(
+                                identityCorrectionApplied
+                                    ? 0
+                                    : previousCheckpoint,
+                                this.countContiguousDeliveredHomeRuns(
+                                    playerId,
+                                    playerData,
+                                    allHomeRunDetails,
+                                    checkpointFloor
+                                )
+                            )
+                        );
+                        if (playerData.lastCheckedHR < currentHomeRuns) {
+                            this.logEvent('warn', 'checkpoint_pending_delivery', {
+                                playerId,
+                                checkpoint: playerData.lastCheckedHR,
+                                currentHomeRuns
+                            });
+                        }
+                        this.saveState({ throwOnError: true });
                     }
 
-                    if (startupCatchUpActive && currentHomeRuns <= this.players[playerId].lastCheckedHR) {
+                    if (startupCatchUpActive && currentHomeRuns <= playerData.lastCheckedHR) {
                         this.startupCatchUpPlayerIds.delete(playerId);
-                        this.log(`${playerData.name}: startup catch-up complete`);
+                        this.logEvent('info', 'startup_catchup_complete', { playerId });
                     }
                 } catch (error) {
-                    this.log(`Error checking ${playerData.name}: ${error.message}`);
-                    console.error(`Full error for ${playerData.name}:`, error);
+                    result.playersFailed++;
+                    this.logEvent('error', 'player_poll_failed', {
+                        playerId,
+                        player: playerData.name,
+                        error: error.message
+                    });
+                } finally {
+                    releasePlayerMutation();
                 }
             }
-            
-            this.saveState();
-            this.log(`Home run check completed. Alerts sent: ${alertsSent}`);
+
+            this.saveState({ throwOnError: true });
+            result.cancelled = this.shuttingDown;
+            if (!result.cancelled && result.playersChecked > 0 && result.playersFailed === 0) {
+                this.lastSuccessfulPollAt = this.clock();
+                this.metrics.checksSucceeded++;
+            } else {
+                this.metrics.checksFailed++;
+            }
+            result.completedAt = this.clock().toISOString();
+            result.pendingEnrichments = this.pendingEnrichments.size;
+            this.logEvent(result.playersFailed === 0 ? 'info' : 'warn', 'poll_completed', result);
+            this.resumePendingEnrichments();
+            return result;
         })();
 
         try {
-            await this.checkInProgress;
+            return await this.checkInProgress;
         } finally {
             this.checkInProgress = null;
         }
@@ -1013,13 +3814,35 @@ class BaseballBot {
             { name: 'Distance', value: compactDistance, inline: true },
             { name: 'Player', value: `${playerData.name} (#${playerData.number})`, inline: true },
             { name: 'Team', value: playerData.team, inline: true },
-            { name: 'Season Total', value: `${totalHomeRuns}`, inline: false }
+            {
+                name: 'Season total at alert time',
+                value: `${totalHomeRuns}`,
+                inline: false
+            }
         ];
     }
 
-    buildCombinedFollowUpFields(totalDongs) {
+    getAnalysisCounts(analysisResult) {
+        const cleared = Number(analysisResult?.total_dongs ?? analysisResult?.parks_cleared);
+        const evaluated = Number(
+            analysisResult?.parks_evaluated ??
+            analysisResult?.parks_expected ??
+            analysisResult?.total_parks
+        );
+        return {
+            cleared: Number.isFinite(cleared) ? cleared : null,
+            evaluated: Number.isFinite(evaluated) && evaluated > 0 ? evaluated : null
+        };
+    }
+
+    buildCombinedFollowUpFields(analysisResult) {
+        const { cleared, evaluated } = this.getAnalysisCounts(analysisResult);
         return [
-            { name: 'Parks Cleared', value: `${totalDongs}/30`, inline: true }
+            {
+                name: 'Parks Cleared',
+                value: cleared !== null && evaluated !== null ? `${cleared}/${evaluated}` : 'Unavailable',
+                inline: true
+            }
         ];
     }
 
@@ -1029,7 +3852,7 @@ class BaseballBot {
             statcastData?.rbi_description ||
             primaryDetails?.rbiDescription ||
             primaryDetails?.rbi_description ||
-            'Solo HR';
+            'Home Run';
         const distanceText = Number.isFinite(Number(statcastData?.hit_distance_sc))
             ? `${Math.round(statcastData.hit_distance_sc)} ft`
             : (primaryDetails?.distance || 'Distance not available');
@@ -1045,9 +3868,11 @@ class BaseballBot {
 
         const titleText = hrType === 'Grand Slam!'
             ? `${playerData.name.toUpperCase()} GRAND SLAM!`
-            : `${playerData.name.toUpperCase()} ${hrType.toUpperCase().replace(' HR', ' HOME RUN')}!`;
+            : (hrType.includes('pending') || hrType === 'Home Run'
+                ? `${playerData.name.toUpperCase()} HOME RUN!`
+                : `${playerData.name.toUpperCase()} ${hrType.toUpperCase().replace(' HR', ' HOME RUN')}!`);
         const description = isNuke
-            ? `${playerData.name} just hit a fucking NUKE!`
+            ? `${playerData.name} just launched a massive home run!`
             : `${playerData.name} just hit a home run!`;
 
         return {
@@ -1059,12 +3884,14 @@ class BaseballBot {
         };
     }
 
-    getAnalysisEmbedColor(totalDongs) {
-        if (totalDongs >= 25) {
+    getAnalysisEmbedColor(analysisResult) {
+        const { cleared, evaluated } = this.getAnalysisCounts(analysisResult);
+        const ratio = cleared !== null && evaluated ? cleared / evaluated : 0;
+        if (ratio >= 0.8) {
             return '#FF2222';
         }
 
-        if (totalDongs >= 15) {
+        if (ratio >= 0.5) {
             return '#FFD700';
         }
 
@@ -1094,26 +3921,48 @@ class BaseballBot {
                 hrType,
                 distanceText
             ))
-            .setColor(analysisResult ? this.getAnalysisEmbedColor(analysisResult.total_dongs) : '#132448')
+            .setColor(analysisResult ? this.getAnalysisEmbedColor(analysisResult) : '#132448')
             .setTimestamp();
 
         if (analysisResult) {
-            embed.addFields(this.buildCombinedFollowUpFields(analysisResult.total_dongs));
+            embed.addFields(this.buildCombinedFollowUpFields(analysisResult));
+        }
+        if (statcastData) {
+            const pitcherDisplay = statcastData.pitcher_team
+                ? `${statcastData.pitcher_name || 'Unknown'} (${statcastData.pitcher_team})`
+                : (statcastData.pitcher_name || 'Unknown');
+            embed.addFields(
+                {
+                    name: 'Exit Velocity',
+                    value: Number.isFinite(Number(statcastData.launch_speed))
+                        ? `${Number(statcastData.launch_speed).toFixed(1)} mph`
+                        : 'Unavailable',
+                    inline: true
+                },
+                {
+                    name: 'Launch Angle',
+                    value: Number.isFinite(Number(statcastData.launch_angle))
+                        ? `${Math.round(Number(statcastData.launch_angle))}°`
+                        : 'Unavailable',
+                    inline: true
+                },
+                { name: 'Off Pitcher', value: pitcherDisplay, inline: true }
+            );
         }
 
         if (footerText) {
             embed.setFooter({ text: footerText });
-        } else if (primaryDetails?.rbi === 'unknown') {
-            embed.setFooter({ text: 'Details may update soonâ€”check back!' });
+        } else if (primaryDetails?.rbi === null || primaryDetails?.detailStatus === 'pending') {
+            embed.setFooter({ text: 'Details may update soon—check back.' });
         }
 
-        const alertThumbnail = this.getPlayerHeadshotUrlById(playerId) || this.getPlayerHeadshotUrl(playerData.name);
+        const alertThumbnail = this.getPlayerHeadshotUrlById(playerId);
         if (alertThumbnail) {
             embed.setThumbnail(alertThumbnail);
         }
 
         const messageOptions = { embeds: [embed] };
-        if (analysisResult?.image_path && fs.existsSync(analysisResult.image_path)) {
+        if (analysisResult?.image_path && this.fileSystem.existsSync(analysisResult.image_path)) {
             const attachment = new Discord.AttachmentBuilder(analysisResult.image_path, { name: 'ballpark_overlay.png' });
             embed.setImage('attachment://ballpark_overlay.png');
             messageOptions.files = [attachment];
@@ -1122,160 +3971,521 @@ class BaseballBot {
         return messageOptions;
     }
 
-    async sendToConfiguredChannels(messageOptions, logLabel, targetChannelIds = this.channelIds) {
-        const successChannelIds = [];
-        const failedChannelIds = [];
-        for (const channelId of targetChannelIds) {
-            try {
-                const channel = await this.client.channels.fetch(channelId);
-                await channel.send(messageOptions);
-                this.log(`Sent ${logLabel} to channel ${channelId}`);
-                successChannelIds.push(channelId);
-            } catch (error) {
-                this.log(`Error sending ${logLabel} to channel ${channelId}: ${error.message}`);
-                console.error(`Full error for channel ${channelId}:`, error);
-                failedChannelIds.push(channelId);
+    async getGameMetadata(gameId) {
+        const cacheKey = String(gameId);
+        const cached = this.gameMetadataCache.get(cacheKey);
+        if (cached && cached.expiresAt > this.clock().getTime()) {
+            return cached.promise;
+        }
+        const promise = this.httpGet(
+            `https://statsapi.mlb.com/api/v1.1/game/${gameId}/feed/live`
+        ).then(response => {
+            const gameData = response?.data?.gameData;
+            const venueId = Number.parseInt(gameData?.venue?.id, 10);
+            const venueName = String(gameData?.venue?.name || '').trim();
+            const homeTeam = String(gameData?.teams?.home?.abbreviation || '').trim();
+            const awayTeam = String(gameData?.teams?.away?.abbreviation || '').trim();
+            if (!Number.isInteger(venueId) || !venueName || !homeTeam || !awayTeam) {
+                throw new Error(`game ${gameId} metadata lacks authoritative venue/team identity`);
             }
-        }
-
-        return { successChannelIds, failedChannelIds };
-    }
-
-    cleanupAnalysisImage(imagePath) {
-        if (!imagePath) {
-            return;
-        }
-
+            return { venueId, venueName, homeTeam, awayTeam };
+        });
+        this.gameMetadataCache.set(cacheKey, {
+            expiresAt: this.clock().getTime() + this.gameMetadataCacheTtlMs,
+            promise
+        });
         try {
-            if (fs.existsSync(imagePath)) {
-                fs.unlinkSync(imagePath);
+            return await promise;
+        } catch (error) {
+            if (this.gameMetadataCache.get(cacheKey)?.promise === promise) {
+                this.gameMetadataCache.delete(cacheKey);
             }
-        } catch (cleanupError) {
-            this.log(`Image cleanup error: ${cleanupError.message}`);
+            throw error;
         }
     }
 
-    buildCompactStatcastFields(statcastData, analysisResult, wallHeight, wallDist, totalDongs, pitcherDisplay) {
-        const statcastDistance = Number.isFinite(Number(statcastData.hit_distance_sc))
-            ? `${Math.round(Number(statcastData.hit_distance_sc))} ft`
-            : 'N/A';
+    async getFullStatcastDataFromSavant(playerId, hrDetail, metadata, selectedPlay) {
+        const rows = await this.getSavantHomeRunRows(playerId, hrDetail.gameId);
+        const row = this.selectSavantHomeRunRow(rows, hrDetail);
+        if (!row) return null;
+        const boundedNumber = (value, minimum, maximum) => {
+            if (value === null || value === undefined || value === '') return null;
+            const numeric = Number(value);
+            return Number.isFinite(numeric) && numeric >= minimum && numeric <= maximum
+                ? numeric
+                : null;
+        };
+        const numericFields = {
+            launch_speed: boundedNumber(row.launch_speed, 20, 130),
+            launch_angle: boundedNumber(row.launch_angle, -89.9, 89.9),
+            hit_distance_sc: boundedNumber(row.hit_distance_sc ?? row.hit_distance, 100, 600),
+            hc_x: boundedNumber(row.hc_x, -1000, 1000),
+            hc_y: boundedNumber(row.hc_y, -1000, 1000),
+            plate_z: boundedNumber(row.plate_z, 0, 20)
+        };
+        if (Object.values(numericFields).some(value => value === null)) return null;
 
-        return [
-            { name: 'Type', value: statcastData.rbi_description || 'HR', inline: true },
-            { name: 'Distance', value: statcastDistance, inline: true },
-            { name: 'Exit Velocity', value: `${statcastData.launch_speed.toFixed(1)} mph`, inline: true },
-            { name: 'Launch Angle', value: `${statcastData.launch_angle.toFixed(0)}\u00b0`, inline: true },
-            { name: 'Spray Direction', value: analysisResult.spray_direction, inline: true },
-            { name: 'Home Team', value: statcastData.home_team || 'N/A', inline: true },
-            { name: 'Wall Height', value: wallHeight, inline: true },
-            { name: 'Wall Distance', value: wallDist, inline: true },
-            { name: 'Parks Cleared', value: `${totalDongs}/30`, inline: true },
-            { name: 'Off Pitcher', value: pitcherDisplay || 'N/A', inline: true }
-        ];
+        const halfInning = String(
+            selectedPlay?.about?.halfInning || row.inning_topbot || ''
+        ).toLowerCase();
+        const pitcherTeam = halfInning === 'top'
+            ? metadata.homeTeam
+            : (['bottom', 'bot'].includes(halfInning) ? metadata.awayTeam : '');
+        const rbi = this.extractSavantRbi(row);
+        return {
+            ...numericFields,
+            game_pk: String(hrDetail.gameId),
+            game_date: row.game_date || hrDetail.gameDate || null,
+            home_team: metadata.homeTeam,
+            venue_id: metadata.venueId,
+            venue_name: metadata.venueName,
+            pitcher_name: selectedPlay?.matchup?.pitcher?.fullName || 'Unknown',
+            pitcher_team: pitcherTeam,
+            rbi,
+            rbi_description: this.getRbiDescription(rbi),
+            statcast_source: 'baseball-savant-csv'
+        };
     }
-
-    // ── Statcast Data Methods ────────────────────────────────
 
     async getStatcastDataForHR(playerId, hrDetail) {
-        // Primary: use MLB playByPlay API (reliable)
-        try {
-            const gameId = hrDetail?.gameId;
-            if (!gameId) return null;
+        const eventId = this.buildHomeRunId(hrDetail, playerId);
+        const cached = this.statcastCache.get(`play:${eventId}`);
+        if (cached && cached.expiresAt > this.clock().getTime()) {
+            return cached.promise;
+        }
 
-            const pbpResp = await axios.get(
-                `https://statsapi.mlb.com/api/v1/game/${gameId}/playByPlay`
-            );
-            const plays = pbpResp.data.allPlays || [];
+        const promise = (async () => {
+            try {
+                const gameId = hrDetail?.gameId;
+                if (!gameId) return null;
+                const [plays, metadata] = await Promise.all([
+                    this.getGamePlays(gameId).catch(error => {
+                        this.logEvent('warn', 'live_feed_plays_unavailable_using_savant', {
+                            playerId,
+                            gameId,
+                            eventId,
+                            error: error.message
+                        });
+                        return [];
+                    }),
+                    this.getGameMetadata(gameId)
+                ]);
+                const matchingHomeRuns = plays
+                    .filter(play => this.isHomeRunByPlayer(play, playerId))
+                    .sort((left, right) =>
+                        (Number.isInteger(left.about?.atBatIndex) ? left.about.atBatIndex : Number.MAX_SAFE_INTEGER) -
+                        (Number.isInteger(right.about?.atBatIndex) ? right.about.atBatIndex : Number.MAX_SAFE_INTEGER)
+                    );
+                let selectedPlay = null;
+                if (Number.isInteger(hrDetail?.atBatIndex)) {
+                    selectedPlay = matchingHomeRuns.find(
+                        play => play.about?.atBatIndex === hrDetail.atBatIndex
+                    ) || null;
+                }
+                if (!selectedPlay && Number.isInteger(hrDetail?.gameHomeRunIndex)) {
+                    selectedPlay = matchingHomeRuns[hrDetail.gameHomeRunIndex - 1] || null;
+                }
+                if (!selectedPlay) {
+                    return this.getFullStatcastDataFromSavant(
+                        playerId,
+                        hrDetail,
+                        metadata,
+                        null
+                    );
+                }
 
-            let hitData = null;
-            let pitcherName = 'Unknown';
-            let plateZ = 3.5;
-            const matchingHomeRuns = plays.filter(play =>
-                play.result?.event === 'Home Run' &&
-                play.matchup?.batter?.id?.toString() === playerId
-            );
+                let hitData = null;
+                let plateZ = null;
+                for (const event of (selectedPlay.playEvents || [])) {
+                    if (event?.hitData) hitData = event.hitData;
+                    const candidatePlateZ = Number(event?.pitchData?.coordinates?.pZ);
+                    if (Number.isFinite(candidatePlateZ)) plateZ = candidatePlateZ;
+                }
+                const requiredNumber = (value, minimum, maximum) => {
+                    if (value === null || value === undefined || value === '') return null;
+                    const numeric = Number(value);
+                    return Number.isFinite(numeric) && numeric >= minimum && numeric <= maximum
+                        ? numeric
+                        : null;
+                };
+                const numericFields = {
+                    launch_speed: requiredNumber(hitData?.launchSpeed, 20, 130),
+                    launch_angle: requiredNumber(hitData?.launchAngle, -89.9, 89.9),
+                    hit_distance_sc: requiredNumber(hitData?.totalDistance, 100, 600),
+                    hc_x: requiredNumber(hitData?.coordinates?.coordX, -1000, 1000),
+                    hc_y: requiredNumber(hitData?.coordinates?.coordY, -1000, 1000),
+                    plate_z: requiredNumber(plateZ, 0, 20)
+                };
+                if (Object.values(numericFields).some(value => value === null)) {
+                    const savantData = await this.getFullStatcastDataFromSavant(
+                        playerId,
+                        hrDetail,
+                        metadata,
+                        selectedPlay
+                    );
+                    if (savantData) {
+                        this.logEvent('info', 'statcast_savant_fallback_used', {
+                            playerId,
+                            gameId,
+                            eventId
+                        });
+                    }
+                    return savantData;
+                }
 
-            let selectedPlay = null;
-            if (Number.isInteger(hrDetail?.atBatIndex)) {
-                selectedPlay = matchingHomeRuns.find(play => play.about?.atBatIndex === hrDetail.atBatIndex) || null;
-            }
-
-            if (!selectedPlay && Number.isInteger(hrDetail?.gameHomeRunIndex)) {
-                selectedPlay = matchingHomeRuns[hrDetail.gameHomeRunIndex - 1] || null;
-            }
-
-            if (!selectedPlay) {
-                selectedPlay = matchingHomeRuns[0] || null;
-            }
-
-            if (!selectedPlay) {
+                const rbiInfo = this.extractRBIInfo(selectedPlay);
+                const halfInning = String(selectedPlay?.about?.halfInning || '').toLowerCase();
+                const pitcherTeam = halfInning === 'top'
+                    ? metadata.homeTeam
+                    : (halfInning === 'bottom' ? metadata.awayTeam : '');
+                return {
+                    ...numericFields,
+                    game_pk: String(gameId),
+                    game_date: hrDetail.gameDate || null,
+                    home_team: metadata.homeTeam,
+                    venue_id: metadata.venueId,
+                    venue_name: metadata.venueName,
+                    pitcher_name: selectedPlay.matchup?.pitcher?.fullName || 'Unknown',
+                    pitcher_team: pitcherTeam,
+                    rbi: rbiInfo.rbi,
+                    rbi_description: rbiInfo.rbiDescription,
+                    statcast_source: 'mlb-live-feed'
+                };
+            } catch (error) {
+                this.logEvent('warn', 'statcast_fetch_failed', {
+                    playerId,
+                    gameId: hrDetail?.gameId || null,
+                    eventId,
+                    error: error.message
+                });
                 return null;
             }
+        })();
+        this.statcastCache.set(`play:${eventId}`, {
+            expiresAt: this.clock().getTime() + this.statcastCacheTtlMs,
+            promise
+        });
+        return promise;
+    }
 
-            const rbiInfo = this.extractRBIInfo(selectedPlay);
-            pitcherName = selectedPlay.matchup?.pitcher?.fullName || 'Unknown';
-            for (const evt of (selectedPlay.playEvents || [])) {
-                if (evt.hitData) {
-                    hitData = evt.hitData;
+    execFileAsync(command, args, options = {}) {
+        if (this.pythonRunner) {
+            return Promise.resolve(this.pythonRunner(command, args, options));
+        }
+        return new Promise((resolve, reject) => {
+            execFile(command, args, options, (error, stdout, stderr) => {
+                if (error) {
+                    error.stdout = stdout;
+                    error.stderr = stderr;
+                    reject(error);
+                    return;
                 }
-                if (evt.pitchData?.coordinates?.pZ) {
-                    plateZ = evt.pitchData.coordinates.pZ;
-                }
+                resolve({ stdout, stderr });
+            });
+        });
+    }
+
+    getPythonEnvironment() {
+        const environment = {
+            ...process.env,
+            PYTHONDONTWRITEBYTECODE: '1'
+        };
+        for (const name of Object.keys(environment)) {
+            if (name.toUpperCase() === 'BOT_TOKEN') {
+                delete environment[name];
             }
+        }
+        return environment;
+    }
 
-            if (!hitData || !hitData.launchSpeed || !hitData.coordinates) return null;
-
-            // Get home/away teams from boxscore
-            let homeTeam = '';
-            let awayTeam = '';
+    async preflightPython() {
+        if (this.pythonPreflightPromise) return this.pythonPreflightPromise;
+        this.pythonPreflightPromise = (async () => {
+            const requiredFiles = [
+                path.join(__dirname, 'scripts', 'hr_analysis.py'),
+                path.join(__dirname, 'data', 'fences.json'),
+                path.join(__dirname, 'data', 'stadium_paths.json'),
+                path.join(__dirname, 'data', 'ballpark_metadata.json')
+            ];
+            const missingFiles = requiredFiles.filter(file => !this.fileSystem.existsSync(file));
+            if (missingFiles.length > 0) {
+                throw new Error(`required analysis files are missing: ${missingFiles.map(path.basename).join(', ')}`);
+            }
+            let ballparkMetadata;
             try {
-                const boxResp = await axios.get(
-                    `https://statsapi.mlb.com/api/v1/game/${gameId}/boxscore`
+                ballparkMetadata = JSON.parse(this.fileSystem.readFileSync(requiredFiles[3], 'utf8'));
+            } catch (error) {
+                throw new Error(`ballpark_metadata.json is invalid: ${error.message}`);
+            }
+            const declaredGeometryHashes = ballparkMetadata?.geometry_files_sha256;
+            for (const geometryFile of requiredFiles.slice(1, 3)) {
+                const fileName = path.basename(geometryFile);
+                const declaredHash = declaredGeometryHashes?.[fileName];
+                if (!/^[a-f0-9]{64}$/i.test(String(declaredHash || ''))) {
+                    throw new Error(`ballpark metadata is missing a valid SHA-256 pin for ${fileName}`);
+                }
+                const actualHash = crypto.createHash('sha256')
+                    .update(this.fileSystem.readFileSync(geometryFile))
+                    .digest('hex');
+                if (actualHash.toLowerCase() !== String(declaredHash).toLowerCase()) {
+                    throw new Error(`${fileName} does not match its ballpark metadata SHA-256 pin`);
+                }
+            }
+            const versionHash = crypto.createHash('sha256');
+            for (const file of requiredFiles) {
+                versionHash.update(this.fileSystem.readFileSync(file));
+            }
+            this.ballparkDataVersion = versionHash.digest('hex').slice(0, 16);
+            this.ballparkMetadataVersion = String(
+                ballparkMetadata?.data_version || ''
+            ).trim() || null;
+            if (!this.ballparkMetadataVersion) {
+                throw new Error('ballpark metadata has no data_version');
+            }
+            const requirementsPath = path.join(
+                __dirname,
+                'requirements.txt'
+            );
+            if (!this.fileSystem.existsSync(requirementsPath)) {
+                throw new Error('requirements.txt is missing');
+            }
+            const pinnedVersions = {};
+            for (const line of this.fileSystem
+                .readFileSync(requirementsPath, 'utf8')
+                .split(/\r?\n/)) {
+                const trimmed = line.trim();
+                if (!trimmed || trimmed.startsWith('#')) continue;
+                const match = trimmed.match(
+                    /^([A-Za-z0-9_.-]+)==([^\s;]+)$/
                 );
-                homeTeam = boxResp.data.teams.home.team.abbreviation || '';
-                awayTeam = boxResp.data.teams.away.team.abbreviation || '';
-            } catch (e) {
-                this.log(`Could not get boxscore for teams: ${e.message}`);
+                if (!match) {
+                    throw new Error(
+                        `requirements.txt contains a non-exact pin: ${trimmed}`
+                    );
+                }
+                pinnedVersions[
+                    match[1].toLowerCase().replace(/[-_.]+/g, '-')
+                ] = match[2];
+            }
+            for (const dependency of [
+                'matplotlib',
+                'numpy',
+                'pillow'
+            ]) {
+                if (!pinnedVersions[dependency]) {
+                    throw new Error(
+                        `requirements.txt has no exact ${dependency} pin`
+                    );
+                }
+            }
+            if (ballparkMetadata?.advanced_analysis_enabled !== true) {
+                const reason = String(
+                    ballparkMetadata?.analysis_disabled_reason ||
+                    'advanced park analysis is disabled by ballpark metadata'
+                ).trim();
+                throw new Error(reason);
+            }
+            const release = ballparkMetadata?.analysis_release;
+            if (!release ||
+                release.status !== 'verified' ||
+                release.source_revisions_recorded !== true ||
+                release.calibration_complete !== true ||
+                release.calculation_rendering_walls_aligned !== true) {
+                throw new Error(
+                    'enabled park analysis lacks a complete verified release attestation'
+                );
             }
 
-            const playerTeamAbbr = this.players[playerId]?.team || '';
-            const pitcherTeam = (playerTeamAbbr === homeTeam) ? awayTeam : homeTeam;
+            const compatiblePythonVersions = ['3.13', '3.12', '3.11', '3.10'];
+            const discoveredCandidates = [
+                { command: path.join(__dirname, 'venv', 'Scripts', 'python.exe'), argsPrefix: [] },
+                { command: path.join(__dirname, '.venv', 'Scripts', 'python.exe'), argsPrefix: [] },
+                { command: path.join(__dirname, 'venv', 'bin', 'python'), argsPrefix: [] },
+                { command: path.join(__dirname, '.venv', 'bin', 'python'), argsPrefix: [] },
+                ...compatiblePythonVersions.map(version => ({
+                    command: `python${version}`,
+                    argsPrefix: []
+                })),
+                { command: 'python3', argsPrefix: [] },
+                { command: 'python', argsPrefix: [] },
+                ...(process.platform === 'win32'
+                    ? compatiblePythonVersions.map(version => ({
+                        command: 'py',
+                        argsPrefix: [`-${version}`]
+                    }))
+                    : [])
+            ];
+            const candidates = this.pythonPath
+                ? [{ command: this.pythonPath, argsPrefix: [] }]
+                : discoveredCandidates;
+            const probe = [
+                '-c',
+                'import sys; ' +
+                    'exec("if not ((3, 10) <= sys.version_info[:2] <= (3, 13)):\\n raise RuntimeError(\'Python 3.10 through 3.13 is required\')"); ' +
+                    'import matplotlib, numpy, PIL; ' +
+                    `expected = ${JSON.stringify({
+                        matplotlib: pinnedVersions.matplotlib,
+                        numpy: pinnedVersions.numpy,
+                        pillow: pinnedVersions.pillow
+                    })}; ` +
+                    'actual = {"matplotlib": matplotlib.__version__, "numpy": numpy.__version__, "pillow": PIL.__version__}; ' +
+                    'exec("if actual != expected:\\n raise RuntimeError(f\'Python dependency versions {actual} do not match {expected}\')"); ' +
+                    'print(sys.version)'
+            ];
+            if (this.pythonRunner) {
+                this.pythonCommand =
+                    this.pythonPath || 'injected-python';
+                this.pythonArgsPrefix = [];
+                await this.execFileAsync(
+                    this.pythonCommand,
+                    probe,
+                    {
+                        timeout: 10000,
+                        windowsHide: true,
+                        maxBuffer: 256 * 1024,
+                        env: this.getPythonEnvironment()
+                    }
+                );
+                this.analysisAvailable = true;
+                this.analysisPermanentlyUnavailable = false;
+                this.analysisUnavailableReason = null;
+                return this.pythonCommand;
+            }
+            let configuredError = null;
+            for (const candidate of candidates) {
+                if (path.isAbsolute(candidate.command) && !this.fileSystem.existsSync(candidate.command)) {
+                    configuredError = new Error(`${candidate.command} does not exist`);
+                    continue;
+                }
+                try {
+                    await this.execFileAsync(candidate.command, [...candidate.argsPrefix, ...probe], {
+                        timeout: 10000,
+                        windowsHide: true,
+                        maxBuffer: 256 * 1024,
+                        env: this.getPythonEnvironment()
+                    });
+                    this.pythonCommand = candidate.command;
+                    this.pythonArgsPrefix = candidate.argsPrefix;
+                    this.analysisAvailable = true;
+                    this.analysisPermanentlyUnavailable = false;
+                    this.analysisUnavailableReason = null;
+                    return candidate.command;
+                } catch (error) {
+                    configuredError = error;
+                    if (this.pythonPath) break;
+                }
+            }
+            if (this.pythonPath) {
+                throw new Error(`configured PYTHON_BIN failed dependency preflight: ${configuredError?.message || 'unknown error'}`);
+            }
+            throw new Error('no Python 3.10-3.13 interpreter with matplotlib, numpy, and Pillow was found');
+        })().catch(error => {
+            this.analysisAvailable = false;
+            this.analysisPermanentlyUnavailable = true;
+            this.analysisUnavailableReason = error.message;
+            throw error;
+        });
+        return this.pythonPreflightPromise;
+    }
 
-            return {
-                launch_speed: hitData.launchSpeed,
-                launch_angle: hitData.launchAngle,
-                hit_distance_sc: hitData.totalDistance,
-                hc_x: hitData.coordinates.coordX,
-                hc_y: hitData.coordinates.coordY,
-                plate_z: plateZ,
-                home_team: homeTeam,
-                pitcher_name: pitcherName,
-                pitcher_team: pitcherTeam,
-                rbi: rbiInfo.rbi,
-                rbi_description: rbiInfo.rbiDescription
-            };
-        } catch (error) {
-            this.log(`Error fetching Statcast data from playByPlay: ${error.message}`);
-            return null;
+    async withAnalysisSlot(task) {
+        if (this.shuttingDown) {
+            throw new Error('Bot is shutting down');
+        }
+        if (this.analysisActive >= this.maxAnalysisConcurrency) {
+            await new Promise(resolve => this.analysisQueue.push(resolve));
+        }
+        if (this.shuttingDown) {
+            throw new Error('Bot is shutting down');
+        }
+        this.analysisActive++;
+        try {
+            return await task();
+        } finally {
+            this.analysisActive--;
+            this.analysisQueue.shift()?.();
         }
     }
 
-    runHRAnalysis(statcastData, playerName, playerId = null) {
-        return new Promise((resolve) => {
-            const scriptPath = path.join(__dirname, 'scripts', 'hr_analysis.py');
-            const fencesPath = path.join(__dirname, 'data', 'fences.json');
-            const stadiumPathsFile = path.join(__dirname, 'data', 'stadium_paths.json');
-            const timestamp = Date.now();
-            const outputImage = path.join(__dirname, 'tmp', `hr_overlay_${timestamp}.png`);
+    isUsableAnalysisResult(result, statcastData) {
+        if (!this.analysisAvailable ||
+            this.analysisPermanentlyUnavailable ||
+            !this.ballparkDataVersion ||
+            !this.ballparkMetadataVersion) {
+            return false;
+        }
+        if (!result || typeof result !== 'object') return false;
+        if (result.source_data_hash !== this.ballparkDataVersion ||
+            result.ballpark_data_version !== this.ballparkMetadataVersion) {
+            return false;
+        }
+        const status = result.analysis_status || (result.success ? 'ok' : 'error');
+        if (!['ok', 'partial'].includes(status)) return false;
+        const { cleared, evaluated } = this.getAnalysisCounts(result);
+        if (cleared === null || evaluated === null || cleared < 0 || cleared > evaluated) return false;
+        const returnedVenueId = Number.parseInt(result.venue_id, 10);
+        const requestedVenueId = Number.parseInt(statcastData?.venue_id, 10);
+        return Number.isInteger(returnedVenueId) &&
+            Number.isInteger(requestedVenueId) &&
+            returnedVenueId === requestedVenueId;
+    }
 
-            // Ensure tmp directory exists
-            const tmpDir = path.join(__dirname, 'tmp');
-            if (!fs.existsSync(tmpDir)) {
-                fs.mkdirSync(tmpDir, { recursive: true });
-            }
+    buildParkAnalysisRecord(result, statcastData) {
+        const { cleared, evaluated } = this.getAnalysisCounts(result);
+        return {
+            parksCleared: cleared,
+            parksEvaluated: evaluated,
+            parksExpected: Number.isFinite(Number(result.parks_expected))
+                ? Number(result.parks_expected)
+                : evaluated,
+            analysisStatus: result.analysis_status || 'ok',
+            analysisWarnings: Array.isArray(result.analysis_warnings) ? result.analysis_warnings : [],
+            ballparkDataVersion: result.ballpark_data_version || null,
+            sourceDataHash: this.ballparkDataVersion,
+            venueId: Number(statcastData.venue_id),
+            venueName: statcastData.venue_name,
+            geometryTeam: result.geometry_team || null,
+            inputs: {
+                launchSpeed: statcastData.launch_speed,
+                launchAngle: statcastData.launch_angle,
+                hitDistance: statcastData.hit_distance_sc,
+                hcX: statcastData.hc_x,
+                hcY: statcastData.hc_y,
+                plateZ: statcastData.plate_z
+            },
+            analyzedAt: this.clock().toISOString()
+        };
+    }
 
+    async runHRAnalysis(statcastData, playerName, playerId = null, eventId = null) {
+        if (!Number.isInteger(Number.parseInt(statcastData?.venue_id, 10)) ||
+            !String(statcastData?.venue_name || '').trim() ||
+            !String(statcastData?.home_team || '').trim()) {
+            this.logEvent('warn', 'analysis_skipped_unknown_venue', {
+                playerId,
+                eventId,
+                venueId: statcastData?.venue_id || null
+            });
+            return null;
+        }
+        const identityKey = eventId || crypto.createHash('sha256')
+            .update(JSON.stringify(statcastData))
+            .digest('hex');
+        const cacheKey = `${this.ballparkDataVersion || 'unversioned'}:${identityKey}`;
+        if (this.analysisCache.has(cacheKey)) {
+            return this.analysisCache.get(cacheKey);
+        }
+
+        const promise = this.withAnalysisSlot(async () => {
+            await this.preflightPython();
+            this.fileSystem.mkdirSync(this.tempRoot, { recursive: true });
+            const assetCacheDirectory = path.join(this.tempRoot, 'asset-cache');
+            this.fileSystem.mkdirSync(assetCacheDirectory, { recursive: true });
+            const tempDirectory = this.fileSystem.mkdtempSync(path.join(this.tempRoot, 'analysis-'));
+            this.activeTempDirectories.add(tempDirectory);
+            const outputImage = path.join(tempDirectory, 'ballpark_overlay.png');
             const args = [
-                scriptPath,
+                path.join(__dirname, 'scripts', 'hr_analysis.py'),
                 '--launch_speed', String(statcastData.launch_speed),
                 '--launch_angle', String(statcastData.launch_angle),
                 '--hit_distance', String(statcastData.hit_distance_sc),
@@ -1283,134 +4493,1266 @@ class BaseballBot {
                 '--hc_y', String(statcastData.hc_y),
                 '--plate_z', String(statcastData.plate_z),
                 '--home_team', statcastData.home_team,
+                '--venue_id', String(statcastData.venue_id),
                 '--player_name', playerName,
                 '--player_id', playerId ? String(playerId) : '',
                 '--pitcher_name', statcastData.pitcher_name || 'Unknown',
                 '--output_image', outputImage,
-                '--fences_path', fencesPath,
-                '--stadium_paths', stadiumPathsFile
+                '--asset_cache_dir', assetCacheDirectory,
+                '--fences_path', path.join(__dirname, 'data', 'fences.json'),
+                '--stadium_paths', path.join(__dirname, 'data', 'stadium_paths.json')
             ];
-
-            // Use venv Python if available, fall back to system python
-            const venvPython = path.join(__dirname, 'venv', 'bin', 'python');
-            const pythonCmd = fs.existsSync(venvPython) ? venvPython : 'python';
-
-            execFile(pythonCmd, args, { timeout: 30000 }, (error, stdout, stderr) => {
-                if (error) {
-                    this.log(`HR analysis error: ${error.message}`);
-                    if (stderr) this.log(`HR analysis stderr: ${stderr}`);
-                    resolve(null);
-                    return;
-                }
-
+            try {
+                const execution = await this.execFileAsync(
+                    this.pythonCommand,
+                    [...this.pythonArgsPrefix, ...args],
+                    {
+                        timeout: 60000,
+                        windowsHide: true,
+                        maxBuffer: 1024 * 1024,
+                        env: this.getPythonEnvironment()
+                    }
+                );
+                const stdout = typeof execution === 'string' ? execution : execution?.stdout;
+                const result = JSON.parse(String(stdout || '').trim());
+                result.analysis_status = result.analysis_status || (result.success ? 'ok' : 'error');
+                result.source_data_hash = this.ballparkDataVersion;
+                result.image_path = result.image_status === 'ok' && this.fileSystem.existsSync(outputImage)
+                    ? outputImage
+                    : null;
+                result.temp_directory = tempDirectory;
+                return result;
+            } catch (error) {
+                let structuredError = null;
                 try {
-                    const result = JSON.parse(stdout.trim());
-                    resolve(result);
-                } catch (parseError) {
-                    this.log(`HR analysis JSON parse error: ${parseError.message}`);
-                    this.log(`Raw stdout: ${stdout}`);
-                    resolve(null);
+                    const parsed = JSON.parse(String(error.stdout || '').trim());
+                    if (parsed && typeof parsed === 'object' &&
+                        (parsed.analysis_status === 'error' || parsed.success === false)) {
+                        structuredError = {
+                            ...parsed,
+                            analysis_status: 'error',
+                            success: false,
+                            permanent_error: true,
+                            image_path: null,
+                            temp_directory: tempDirectory
+                        };
+                    }
+                } catch {}
+                if (structuredError) {
+                    this.logEvent('warn', 'analysis_degraded', {
+                        playerId,
+                        eventId,
+                        gameId: statcastData.game_pk || null,
+                        venueId: statcastData.venue_id,
+                        error: structuredError.analysis_error || 'analysis returned a structured error'
+                    });
+                    return structuredError;
                 }
-            });
+                this.logEvent('error', 'analysis_failed', {
+                    playerId,
+                    eventId,
+                    gameId: statcastData.game_pk || null,
+                    venueId: statcastData.venue_id,
+                    error: error.message,
+                    stderr: error.stderr ? String(error.stderr).slice(0, 1000) : undefined
+                });
+                this.cleanupAnalysisArtifacts(tempDirectory);
+                return null;
+            }
         });
+        this.analysisCache.set(cacheKey, promise);
+        void promise.then(
+            result => {
+                if (!result && this.analysisCache.get(cacheKey) === promise) {
+                    this.analysisCache.delete(cacheKey);
+                }
+            },
+            () => {
+                if (this.analysisCache.get(cacheKey) === promise) {
+                    this.analysisCache.delete(cacheKey);
+                }
+            }
+        );
+        return promise;
     }
 
-    async waitForStatcastAndSend(playerId, playerData, totalHRs, hrDetail, hrId, pendingChannelIds) {
-        const POLL_INTERVAL = 30000;  // 30 seconds between attempts
-        const MAX_WAIT = 600000;      // 10 minutes total
-        const gameId = hrDetail?.gameId;
+    cleanupAnalysisArtifacts(targetPath) {
+        if (!targetPath) return;
+        let candidateDirectory;
+        try {
+            if (!this.fileSystem.existsSync(targetPath)) {
+                this.activeTempDirectories.delete(path.resolve(targetPath));
+                return;
+            }
+            candidateDirectory = this.fileSystem.statSync(targetPath).isDirectory()
+                ? targetPath
+                : path.dirname(targetPath);
+        } catch (error) {
+            if (error?.code === 'ENOENT') {
+                this.activeTempDirectories.delete(path.resolve(targetPath));
+                return;
+            }
+            this.logEvent('warn', 'analysis_cleanup_inspection_failed', {
+                targetPath,
+                error: error.message
+            });
+            return;
+        }
+        const resolvedRoot = path.resolve(this.tempRoot);
+        const resolvedDirectory = path.resolve(candidateDirectory);
+        if (!resolvedDirectory.startsWith(`${resolvedRoot}${path.sep}`)) {
+            this.logEvent('warn', 'cleanup_refused_outside_temp_root', { targetPath });
+            return;
+        }
+        if (path.dirname(resolvedDirectory) !== resolvedRoot ||
+            !path.basename(resolvedDirectory).startsWith('analysis-')) {
+            this.logEvent('warn', 'cleanup_refused_non_analysis_directory', { targetPath });
+            return;
+        }
+        try {
+            this.fileSystem.rmSync(resolvedDirectory, { recursive: true, force: true });
+            this.activeTempDirectories.delete(resolvedDirectory);
+        } catch (error) {
+            this.logEvent('warn', 'analysis_cleanup_failed', { targetPath, error: error.message });
+        }
+    }
 
-        this.log(`Waiting for Statcast data before sending ${playerData.name} HR ${hrId} (up to 10 min)...`);
-
-        let statcastData = null;
-        let analysisResult = null;
-        const startTime = Date.now();
-
-        // Poll for Statcast data up to 10 minutes
-        while (Date.now() - startTime < MAX_WAIT) {
-            await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
-
-            if (!gameId) break;
-
+    async sendInitialAlert(playerId, playerData, totalHomeRuns, hrDetail, hrId, channelIds) {
+        const successChannelIds = [];
+        const failedChannelIds = [];
+        for (const channelId of channelIds) {
+            if (this.shuttingDown) break;
             try {
-                statcastData = await this.getStatcastDataForHR(playerId, hrDetail);
-                if (!statcastData) {
-                    this.log(`Statcast not yet available for ${playerData.name} HR ${hrId} (${Math.round((Date.now() - startTime) / 1000)}s elapsed)`);
-                    continue;
+                const channel = await this.client.channels.fetch(channelId);
+                if (this.shuttingDown) break;
+                const messageOptions = this.buildAlertMessageOptions(
+                    playerId,
+                    playerData,
+                    totalHomeRuns,
+                    hrDetail,
+                    { footerText: 'Statcast analysis is pending.' }
+                );
+                messageOptions.nonce = this.buildDiscordNonce(
+                    'home-run',
+                    channelId,
+                    hrId
+                );
+                messageOptions.enforceNonce = true;
+                const sentMessage = await channel.send(messageOptions);
+                this.markHomeRunSentToChannels(playerData, hrId, [channelId], {
+                    messageId: sentMessage?.id ? String(sentMessage.id) : null,
+                    deliveryMode: 'basic-alert',
+                    playerId: String(playerId),
+                    season: this.currentSeason,
+                    hrId,
+                    totalHomeRuns,
+                    hrDetail,
+                    enrichedAt: null,
+                    enrichmentDeliveryMode: null,
+                    enrichmentMessageId: null,
+                    imageDelivered: false,
+                    retractedAt: null,
+                    correctionMessageId: null
+                });
+                successChannelIds.push(channelId);
+                this.metrics.delivered++;
+                try {
+                    this.saveState({ throwOnError: true });
+                } catch (persistenceError) {
+                    const pendingRecord = {
+                        playerId: String(playerId),
+                        season: this.currentSeason,
+                        hrId,
+                        totalHomeRuns,
+                        hrDetail,
+                        channelIds: [...successChannelIds],
+                        createdAt: this.clock().toISOString(),
+                        attempts: 0
+                    };
+                    this.queueEnrichment(pendingRecord, { persist: false });
+                    this.logEvent('fatal', 'delivery_ack_persistence_failed', {
+                        playerId,
+                        gameId: hrDetail.gameId,
+                        eventId: hrId,
+                        channelId,
+                        messageId: sentMessage?.id || null,
+                        error: persistenceError.message
+                    });
+                    this.scheduleFatalShutdown('delivery-ack-persistence-failed', persistenceError);
+                    persistenceError.deliveryAcknowledged = true;
+                    throw persistenceError;
                 }
-
-                this.log(`Got Statcast for ${playerData.name}: EV=${statcastData.launch_speed}, LA=${statcastData.launch_angle}, Dist=${statcastData.hit_distance_sc}`);
-
-                analysisResult = await this.runHRAnalysis(statcastData, playerData.name, playerId);
-                if (!analysisResult || !analysisResult.success) {
-                    this.log(`HR analysis failed for ${playerData.name}, will retry...`);
-                    statcastData = null;
-                    analysisResult = null;
-                    continue;
-                }
-
-                this.log(`HR analysis complete for ${playerData.name}: ${analysisResult.total_dongs}/30 parks`);
-                break; // Got everything we need
+                this.logEvent('info', 'basic_alert_delivered', {
+                    playerId,
+                    gameId: hrDetail.gameId,
+                    eventId: hrId,
+                    channelId,
+                    messageId: sentMessage?.id || null
+                });
             } catch (error) {
-                this.log(`Statcast poll error for ${playerData.name}: ${error.message}`);
+                if (error.deliveryAcknowledged) {
+                    throw error;
+                }
+                failedChannelIds.push(channelId);
+                this.metrics.failed++;
+                this.logEvent('error', 'basic_alert_failed', {
+                    playerId,
+                    gameId: hrDetail.gameId,
+                    eventId: hrId,
+                    channelId,
+                    error: error.message
+                });
             }
         }
+        if (successChannelIds.length > 0) {
+            this.queueEnrichment({
+                playerId,
+                season: this.currentSeason,
+                hrId,
+                totalHomeRuns,
+                hrDetail,
+                channelIds: successChannelIds,
+                createdAt: this.clock().toISOString(),
+                attempts: 0
+            });
+        }
+        return { successChannelIds, failedChannelIds };
+    }
 
-        // Build and send the single combined message
+    mergeEnrichmentRecord(target, incoming) {
+        if (!target || !incoming || target === incoming) return target || incoming;
+        if (!Array.isArray(target.channelIds)) target.channelIds = [];
+        for (const channelId of incoming.channelIds || []) {
+            const normalized = String(channelId);
+            if (!target.channelIds.includes(normalized)) {
+                target.channelIds.push(normalized);
+            }
+        }
+        target.playerId = String(incoming.playerId ?? target.playerId);
+        target.season = Number(incoming.season ?? target.season);
+        target.hrId = String(incoming.hrId ?? target.hrId);
+        if (incoming.totalHomeRuns !== undefined &&
+            incoming.totalHomeRuns !== null) {
+            target.totalHomeRuns = incoming.totalHomeRuns;
+        }
+        target.hrDetail = {
+            ...(target.hrDetail || {}),
+            ...(incoming.hrDetail || {})
+        };
+        const createdAtCandidates = [target.createdAt, incoming.createdAt]
+            .filter(value => Number.isFinite(Date.parse(value)))
+            .sort((left, right) => Date.parse(left) - Date.parse(right));
+        target.createdAt = createdAtCandidates[0] ||
+            target.createdAt ||
+            incoming.createdAt;
+        target.previousHrIds = [...new Set([
+            ...(target.previousHrIds || []),
+            ...(incoming.previousHrIds || [])
+        ].map(String))].filter(id => id !== target.hrId);
+        if (incoming.cancelledReason && !target.cancelledReason) {
+            target.cancelledReason = incoming.cancelledReason;
+        }
+        const nextAttemptCandidates = [target.nextAttemptAt, incoming.nextAttemptAt]
+            .filter(value => Number.isFinite(Date.parse(value)))
+            .sort((left, right) => Date.parse(left) - Date.parse(right));
+        if (nextAttemptCandidates.length > 0) {
+            target.nextAttemptAt = nextAttemptCandidates[0];
+        }
+        const lastAttemptCandidates = [target.lastAttemptAt, incoming.lastAttemptAt]
+            .filter(value => Number.isFinite(Date.parse(value)))
+            .sort((left, right) => Date.parse(right) - Date.parse(left));
+        if (lastAttemptCandidates.length > 0) {
+            target.lastAttemptAt = lastAttemptCandidates[0];
+        }
+        for (const field of [
+            'statcastData',
+            'analysisResult',
+            'imageStatus',
+            'terminalReason',
+            'terminalLoggedAt',
+        ]) {
+            if (target[field] === undefined && incoming[field] !== undefined) {
+                target[field] = incoming[field];
+            }
+        }
+        for (const field of [
+            'attempts',
+            'dataAttempts',
+            'analysisAttempts',
+            'deliveryAttempts',
+            'imageRegenerationAttempts',
+        ]) {
+            target[field] = Math.max(
+                Number(target[field]) || 0,
+                Number(incoming[field]) || 0
+            );
+        }
+        return target;
+    }
+
+    isEnrichmentRecordActive(record) {
+        return [...this.activeEnrichmentRecords.values()]
+            .some(activeRecord => activeRecord === record);
+    }
+
+    getPendingEnrichmentKey(record, fallbackKey = null) {
+        const canonicalKey =
+            `${record.season}:${record.playerId}:${record.hrId}`;
+        if (this.pendingEnrichments.get(canonicalKey) === record) {
+            return canonicalKey;
+        }
+        if (fallbackKey && this.pendingEnrichments.get(fallbackKey) === record) {
+            return fallbackKey;
+        }
+        const matchingEntry = [...this.pendingEnrichments.entries()]
+            .find(([, candidate]) => candidate === record);
+        return matchingEntry?.[0] || canonicalKey;
+    }
+
+    queueEnrichment(record, { persist = true } = {}) {
+        const jobKey = `${record.season}:${record.playerId}:${record.hrId}`;
+        const existing = this.pendingEnrichments.get(jobKey);
+        const merged = existing
+            ? this.mergeEnrichmentRecord(existing, record)
+            : {
+                ...record,
+                channelIds: [...new Set((record.channelIds || []).map(String))]
+            };
+        this.pendingEnrichments.set(jobKey, merged);
+        if (persist) {
+            this.saveState({ throwOnError: true });
+        }
+        if (!this.isEnrichmentRecordActive(merged) &&
+            !this.enrichmentQueue.includes(jobKey)) {
+            this.enrichmentQueue.push(jobKey);
+            this.metrics.queued++;
+            this.pumpEnrichmentQueue();
+        }
+    }
+
+    resumePendingEnrichments() {
+        const now = this.clock().getTime();
+        for (const [jobKey, record] of this.pendingEnrichments) {
+            if (record.nextAttemptAt && Date.parse(record.nextAttemptAt) > now) continue;
+            if (!this.isEnrichmentRecordActive(record) &&
+                !this.activeEnrichmentJobs.has(jobKey) &&
+                !this.enrichmentQueue.includes(jobKey)) {
+                this.enrichmentQueue.push(jobKey);
+            }
+        }
+        this.pumpEnrichmentQueue();
+        this.scheduleEnrichmentWake();
+    }
+
+    scheduleEnrichmentWake() {
+        if (this.enrichmentWakeTimer) {
+            clearTimeout(this.enrichmentWakeTimer);
+            this.enrichmentWakeTimer = null;
+        }
+        if (this.shuttingDown || this.pendingEnrichments.size === 0) return;
+        const now = this.clock().getTime();
+        const queuedKeys = new Set(this.enrichmentQueue);
+        const nextDueTimes = [...this.pendingEnrichments.entries()]
+            .filter(([jobKey, record]) =>
+                !queuedKeys.has(jobKey) &&
+                !this.isEnrichmentRecordActive(record)
+            )
+            .map(([, record]) =>
+                record.nextAttemptAt ? Date.parse(record.nextAttemptAt) : now
+            )
+            .filter(Number.isFinite);
+        if (nextDueTimes.length === 0) return;
+        const nextDue = Math.min(...nextDueTimes);
+        const delay = Math.max(0, nextDue - now);
+        this.enrichmentWakeTimer = setTimeout(() => {
+            this.enrichmentWakeTimer = null;
+            this.resumePendingEnrichments();
+        }, Math.min(delay, 0x7fffffff));
+    }
+
+    pumpEnrichmentQueue() {
+        while (!this.shuttingDown &&
+            this.enrichmentActive < this.maxEnrichmentConcurrency &&
+            this.enrichmentQueue.length > 0) {
+            const jobKey = this.enrichmentQueue.shift();
+            const record = this.pendingEnrichments.get(jobKey);
+            if (!record ||
+                this.activeEnrichmentJobs.has(jobKey) ||
+                this.isEnrichmentRecordActive(record)) {
+                continue;
+            }
+            if (record.nextAttemptAt && Date.parse(record.nextAttemptAt) > this.clock().getTime()) {
+                continue;
+            }
+            this.enrichmentActive++;
+            const job = this.processEnrichment(jobKey, record)
+                .catch(error => {
+                    this.logEvent('error', 'enrichment_job_failed', {
+                        jobId: jobKey,
+                        playerId: record.playerId,
+                        eventId: record.hrId,
+                        error: error.message
+                    });
+                })
+                .finally(() => {
+                    this.enrichmentActive--;
+                    this.activeEnrichmentJobs.delete(jobKey);
+                    this.activeEnrichmentRecords.delete(jobKey);
+                    this.backgroundJobs.delete(job);
+                    this.pumpEnrichmentQueue();
+                    this.scheduleEnrichmentWake();
+                });
+            this.activeEnrichmentJobs.set(jobKey, job);
+            this.activeEnrichmentRecords.set(jobKey, record);
+            this.backgroundJobs.add(job);
+        }
+    }
+
+    async updateEnrichedAlert(
+        playerId,
+        playerData,
+        record,
+        channelId,
+        statcastData,
+        analysisResult,
+        footerText
+    ) {
+        const releaseEventMutation =
+            await this.acquireKeyedLock(
+                this.discordEventMutationLocks,
+                `${channelId}:${record.hrId}`
+            );
+        try {
+            return await this.updateEnrichedAlertCore(
+                playerId,
+                playerData,
+                record,
+                channelId,
+                statcastData,
+                analysisResult,
+                footerText
+            );
+        } finally {
+            releaseEventMutation();
+        }
+    }
+
+    async updateEnrichedAlertCore(playerId, playerData, record, channelId, statcastData, analysisResult, footerText) {
+        if (this.shuttingDown || record.cancelledReason) {
+            throw new Error('Enrichment delivery was cancelled');
+        }
+        let deliveryRecord = this.getAlertDeliveryRecord(
+            playerData,
+            channelId,
+            record.hrId
+        );
+        if (!deliveryRecord) {
+            throw new Error(
+                `No basic-alert delivery record exists for ${record.hrId} in ${channelId}`
+            );
+        }
+        if (deliveryRecord.retractedAt ||
+            deliveryRecord.retractionInProgress) {
+            record.cancelledReason = record.cancelledReason || 'official-correction';
+            throw new Error('Cannot enrich an alert that MLB has retracted');
+        }
+        if (deliveryRecord.enrichmentFailedAt) {
+            throw new Error('Enrichment delivery is already terminal');
+        }
+        if (deliveryRecord.enrichedAt) return true;
+        const channel = await this.client.channels.fetch(channelId);
+        deliveryRecord = this.getAlertDeliveryRecord(
+            playerData,
+            channelId,
+            record.hrId
+        );
+        if (!deliveryRecord) {
+            throw new Error(
+                `Basic-alert delivery disappeared for ${record.hrId} in ${channelId}`
+            );
+        }
+        if (deliveryRecord.retractedAt ||
+            deliveryRecord.retractionInProgress) {
+            record.cancelledReason = record.cancelledReason || 'official-correction';
+            throw new Error('Cannot enrich an alert that MLB has retracted');
+        }
+        if (deliveryRecord.enrichmentFailedAt) {
+            throw new Error('Enrichment delivery is already terminal');
+        }
         const messageOptions = this.buildAlertMessageOptions(
             playerId,
             playerData,
-            totalHRs,
-            hrDetail,
-            {
-                statcastData,
-                analysisResult,
-                footerText: (!statcastData) ? 'Statcast data was not available' : null
-            }
+            record.totalHomeRuns,
+            record.hrDetail,
+            { statcastData, analysisResult, footerText }
         );
+        let deliveryMode = 'follow-up';
+        let deliveredMessageId = null;
+        let releaseEditedMessageMutation = null;
+        if (deliveryRecord.messageId && channel.messages?.fetch) {
+            const basicMessageId = deliveryRecord.messageId;
+            const releaseMessageMutation =
+                await this.acquireKeyedLock(
+                    this.discordMessageMutationLocks,
+                    `${channelId}:${basicMessageId}`
+                );
+            try {
+                deliveryRecord = this.getAlertDeliveryRecord(
+                    playerData,
+                    channelId,
+                    record.hrId
+                );
+                if (!deliveryRecord ||
+                    deliveryRecord.retractedAt ||
+                    deliveryRecord.retractionInProgress ||
+                    deliveryRecord.enrichmentFailedAt ||
+                    this.shuttingDown ||
+                    record.cancelledReason) {
+                    record.cancelledReason =
+                        record.cancelledReason ||
+                        (deliveryRecord?.retractedAt ||
+                            deliveryRecord?.retractionInProgress
+                            ? 'official-correction'
+                            : 'delivery-unavailable');
+                    const error = new Error(
+                        'Enrichment delivery was cancelled'
+                    );
+                    error.enrichmentCancelled = true;
+                    throw error;
+                }
+                const existingMessage =
+                    await channel.messages.fetch(basicMessageId);
+                if (this.shuttingDown || record.cancelledReason) {
+                    const error = new Error(
+                        'Enrichment delivery was cancelled'
+                    );
+                    error.enrichmentCancelled = true;
+                    throw error;
+                }
+                const edited = await existingMessage.edit(messageOptions);
+                deliveryMode = 'edited';
+                deliveredMessageId =
+                    edited?.id || basicMessageId;
+                releaseEditedMessageMutation = releaseMessageMutation;
+            } catch (error) {
+                if (error.enrichmentCancelled) throw error;
+                this.logEvent('warn', 'alert_edit_failed_using_followup', {
+                    playerId,
+                    eventId: record.hrId,
+                    channelId,
+                    messageId: basicMessageId,
+                    error: error.message
+                });
+            } finally {
+                if (releaseEditedMessageMutation !==
+                    releaseMessageMutation) {
+                    releaseMessageMutation();
+                }
+            }
+        }
+        try {
+            if (deliveryMode === 'follow-up') {
+                if (this.shuttingDown || record.cancelledReason) {
+                    throw new Error('Enrichment delivery was cancelled');
+                }
+                messageOptions.nonce = this.buildDiscordNonce(
+                    'enrichment',
+                    channelId,
+                    record.hrId
+                );
+                messageOptions.enforceNonce = true;
+                const followUp = await channel.send(messageOptions);
+                deliveredMessageId = followUp?.id || null;
+            }
+            deliveryRecord = this.getAlertDeliveryRecord(
+                playerData,
+                channelId,
+                record.hrId
+            );
+            if (!deliveryRecord) {
+                throw new Error(
+                    `Basic-alert delivery disappeared for ${record.hrId} in ${channelId}`
+                );
+            }
+            if (deliveryMode === 'follow-up' && deliveredMessageId) {
+                Object.assign(deliveryRecord, {
+                    enrichmentDeliveryMode: deliveryMode,
+                    enrichmentMessageId: deliveredMessageId,
+                    imageDelivered: Boolean(messageOptions.files?.length)
+                });
+            }
+            Object.assign(deliveryRecord, {
+                enrichedAt: this.clock().toISOString(),
+                enrichmentDeliveryMode: deliveryMode,
+                enrichmentMessageId: deliveredMessageId,
+                imageDelivered: Boolean(messageOptions.files?.length),
+                parkAnalysisDelivered: Boolean(analysisResult),
+                analysisSourceDataHash: analysisResult
+                    ? this.ballparkDataVersion
+                    : null,
+                analysisMetadataVersion: analysisResult
+                    ? this.ballparkMetadataVersion
+                    : null
+            });
+            record.channelIds = [
+                ...new Set((record.channelIds || []).map(String))
+            ].filter(candidateChannelId =>
+                candidateChannelId !== String(channelId)
+            );
+            const pendingEntries = [
+                ...this.pendingEnrichments.entries()
+            ].filter(([, candidate]) => candidate === record);
+            if (pendingEntries.length > 0) {
+                for (const [pendingKey] of pendingEntries) {
+                    this.pendingEnrichments.delete(pendingKey);
+                }
+                if (record.channelIds.length > 0) {
+                    this.pendingEnrichments.set(
+                        `${record.season}:${record.playerId}:${record.hrId}`,
+                        record
+                    );
+                }
+            }
+            try {
+                this.saveState({ throwOnError: true });
+            } catch (error) {
+                this.logEvent('fatal', 'enrichment_ack_persistence_failed', {
+                    playerId,
+                    eventId: record.hrId,
+                    channelId,
+                    messageId: deliveredMessageId,
+                    error: error.message
+                });
+                this.scheduleFatalShutdown(
+                    'enrichment-ack-persistence-failed',
+                    error
+                );
+                throw error;
+            }
+            if (this.shuttingDown || record.cancelledReason) {
+                throw new Error(
+                    'Enrichment delivery was cancelled after Discord accepted it'
+                );
+            }
+            return true;
+        } finally {
+            if (releaseEditedMessageMutation) {
+                releaseEditedMessageMutation();
+            }
+        }
+    }
 
-        const deliveryResult = await this.sendToConfiguredChannels(messageOptions, 'home-run-alert', pendingChannelIds);
+    async withdrawStaleParkAnalysisDeliveries() {
+        let reviewed = 0;
+        let withdrawn = 0;
+        let deferred = 0;
+        for (const [playerId, playerData] of Object.entries(this.players)) {
+            for (const channelId of this.channelIds) {
+                const records =
+                    playerData.alertMessagesByChannel?.[channelId] || {};
+                for (const [eventId, delivery] of Object.entries(records)) {
+                    if (this.shuttingDown || !delivery?.enrichedAt ||
+                        delivery.parkAnalysisDelivered === false ||
+                        delivery.parkAnalysisWithdrawnAt) {
+                        continue;
+                    }
+                    const currentVersion =
+                        this.analysisAvailable &&
+                        !this.analysisPermanentlyUnavailable &&
+                        delivery.analysisSourceDataHash ===
+                            this.ballparkDataVersion &&
+                        delivery.analysisMetadataVersion ===
+                            this.ballparkMetadataVersion;
+                    if (delivery.parkAnalysisDelivered === true &&
+                        currentVersion) {
+                        continue;
+                    }
 
-        if (deliveryResult.successChannelIds.length === 0) {
-            this.log(`Alert failed for ${playerData.name} HR ${hrId}; leaving pending`);
-            return false;
+                    reviewed++;
+                    const mutationEventId =
+                        playerData.eventAliases?.[eventId] ||
+                        delivery.hrId ||
+                        eventId;
+                    const releaseEventMutation =
+                        await this.acquireKeyedLock(
+                            this.discordEventMutationLocks,
+                            `${channelId}:${mutationEventId}`
+                        );
+                    try {
+                        if (delivery.parkAnalysisDelivered === false ||
+                            delivery.parkAnalysisWithdrawnAt) {
+                            continue;
+                        }
+                        const messageId =
+                            delivery.enrichmentMessageId ||
+                            delivery.messageId;
+                        if (!messageId) {
+                            deferred++;
+                            this.logEvent(
+                                'warn',
+                                'park_analysis_withdrawal_missing_message',
+                                { playerId, eventId, channelId }
+                            );
+                            continue;
+                        }
+                        const channel = await this.client.channels.fetch(
+                            channelId
+                        );
+                        const releaseMessageMutation =
+                            await this.acquireKeyedLock(
+                                this.discordMessageMutationLocks,
+                                `${channelId}:${messageId}`
+                            );
+                        try {
+                            if (delivery.parkAnalysisDelivered === false ||
+                                delivery.parkAnalysisWithdrawnAt) {
+                                continue;
+                            }
+                            const nowCurrentVersion =
+                                this.analysisAvailable &&
+                                !this.analysisPermanentlyUnavailable &&
+                                delivery.analysisSourceDataHash ===
+                                    this.ballparkDataVersion &&
+                                delivery.analysisMetadataVersion ===
+                                    this.ballparkMetadataVersion;
+                            if (delivery.parkAnalysisDelivered === true &&
+                                nowCurrentVersion) {
+                                continue;
+                            }
+                            const message = await channel.messages.fetch(
+                                messageId
+                            );
+                            if (!message?.embeds?.[0]) {
+                                throw new Error(
+                                    'enriched alert has no editable embed'
+                                );
+                            }
+                            const embedData =
+                                typeof message.embeds[0].toJSON === 'function'
+                                    ? message.embeds[0].toJSON()
+                                    : structuredClone(message.embeds[0].data ||
+                                        message.embeds[0]);
+                            const fields = Array.isArray(embedData.fields)
+                                ? embedData.fields
+                                : [];
+                            const retainedFields = fields.filter(field =>
+                                String(field?.name || '')
+                                    .trim()
+                                    .toLowerCase() !== 'parks cleared'
+                            );
+                            const hasParkField =
+                                retainedFields.length !== fields.length;
+                            const hasOverlayImage =
+                                delivery.imageDelivered === true ||
+                                String(embedData.image?.url || '')
+                                    .includes('ballpark_overlay');
+                            if (hasParkField || hasOverlayImage) {
+                                const existingFooter =
+                                    String(embedData.footer?.text || '').trim();
+                                const withdrawalNotice =
+                                    'Prior park projection withdrawn after a geometry calibration review; Statcast details are retained.';
+                                const footerText = existingFooter
+                                    ? `${existingFooter} ${withdrawalNotice}`
+                                    : withdrawalNotice;
+                                const revisedData = {
+                                    ...embedData,
+                                    fields: retainedFields,
+                                    color: 0x747f8d,
+                                    footer: {
+                                        ...(embedData.footer || {}),
+                                        text: footerText.slice(0, 2048)
+                                    }
+                                };
+                                delete revisedData.image;
+                                const revisedEmbed =
+                                    Discord.EmbedBuilder.from(revisedData);
+                                await message.edit({
+                                    embeds: [revisedEmbed],
+                                    attachments: []
+                                });
+                                delivery.parkAnalysisWithdrawnAt =
+                                    this.clock().toISOString();
+                                withdrawn++;
+                            }
+                            delivery.parkAnalysisDelivered = false;
+                            delivery.imageDelivered = false;
+                            delivery.analysisSourceDataHash = null;
+                            delivery.analysisMetadataVersion = null;
+                            try {
+                                this.saveState({ throwOnError: true });
+                            } catch (error) {
+                                this.scheduleFatalShutdown(
+                                    'park-analysis-withdrawal-persistence-failed',
+                                    error
+                                );
+                                throw error;
+                            }
+                        } finally {
+                            releaseMessageMutation();
+                        }
+                    } catch (error) {
+                        deferred++;
+                        this.logEvent(
+                            'warn',
+                            'park_analysis_withdrawal_deferred',
+                            {
+                                playerId,
+                                eventId,
+                                channelId,
+                                messageId,
+                                error: error.message
+                            }
+                        );
+                    } finally {
+                        releaseEventMutation();
+                    }
+                }
+            }
+        }
+        this.logEvent('info', 'park_analysis_withdrawal_completed', {
+            reviewed,
+            withdrawn,
+            deferred
+        });
+        return { reviewed, withdrawn, deferred };
+    }
+
+    async processEnrichment(jobKey, record) {
+        try {
+            return await this.processEnrichmentCore(jobKey, record);
+        } finally {
+            const eventIds = new Set([
+                String(record.hrId),
+                ...(record.previousHrIds || []).map(String)
+            ]);
+            const matchingCacheKeys = [...this.analysisCache.keys()]
+                .filter(key => [...eventIds].some(eventId =>
+                    key.endsWith(`:${eventId}`) ||
+                    key.includes(`:${eventId}:artifact:`)
+                ));
+            for (const analysisCacheKey of matchingCacheKeys) {
+                const cachedAnalysis = this.analysisCache.get(analysisCacheKey);
+                try {
+                    const result = await Promise.resolve(cachedAnalysis);
+                    if (result?.temp_directory) {
+                        this.cleanupAnalysisArtifacts(result.temp_directory);
+                    }
+                } catch {}
+                this.analysisCache.delete(analysisCacheKey);
+            }
+        }
+    }
+
+    deferEnrichment(jobKey, record, delayMs, { kind = 'data' } = {}) {
+        jobKey = this.getPendingEnrichmentKey(record, jobKey);
+        record.attempts = (record.attempts || 0) + 1;
+        if (kind === 'delivery') {
+            record.deliveryAttempts = (record.deliveryAttempts || 0) + 1;
+        } else if (kind === 'analysis') {
+            record.analysisAttempts = (record.analysisAttempts || 0) + 1;
+        } else {
+            record.dataAttempts = (record.dataAttempts || 0) + 1;
+        }
+        record.lastAttemptAt = this.clock().toISOString();
+        record.nextAttemptAt = new Date(this.clock().getTime() + delayMs).toISOString();
+        this.pendingEnrichments.set(jobKey, record);
+        this.saveState({ throwOnError: true });
+    }
+
+    async processEnrichmentCore(jobKey, record) {
+        jobKey = this.getPendingEnrichmentKey(record, jobKey);
+        const playerId = String(record.playerId);
+        const playerData = this.players[playerId];
+        if (!playerData ||
+            record.season !== this.currentSeason ||
+            record.cancelledReason) {
+            this.pendingEnrichments.delete(jobKey);
+            this.saveState({ throwOnError: true });
+            return;
+        }
+        record.channelIds = (record.channelIds || []).filter(channelId => {
+            const delivery = this.getAlertDeliveryRecord(
+                playerData,
+                channelId,
+                record.hrId
+            );
+            return delivery?.basicSentAt &&
+                !delivery.enrichedAt &&
+                !delivery.retractedAt &&
+                !delivery.enrichmentFailedAt;
+        });
+        if (record.channelIds.length === 0) {
+            this.pendingEnrichments.delete(jobKey);
+            this.saveState({ throwOnError: true });
+            return;
         }
 
-        this.markHomeRunSentToChannels(playerData, hrId, deliveryResult.successChannelIds);
+        let attemptsThisRun = 0;
+        let statcastData = record.statcastData || null;
+        let analysisResult = record.analysisResult || null;
+        let analysisError = null;
+        const createdAt = Date.parse(record.createdAt);
+        const ageMs = Number.isFinite(createdAt)
+            ? Math.max(0, this.clock().getTime() - createdAt)
+            : 0;
+        const dataAttempts = Number(record.dataAttempts ?? record.attempts ?? 0);
+        const analysisAttempts = Number(record.analysisAttempts || 0);
+        let terminalStatcastFailure = record.terminalReason === 'statcast-unavailable' ||
+            ageMs >= this.enrichmentMaxAgeMs ||
+            dataAttempts >= this.enrichmentMaxDataAttempts;
+        const terminalAnalysisFailure =
+            record.terminalReason === 'analysis-unavailable' ||
+            ageMs >= this.enrichmentMaxAgeMs ||
+            analysisAttempts >= this.enrichmentMaxDataAttempts;
 
-        // Store parks cleared count
-        if (analysisResult && Number.isFinite(analysisResult.total_dongs)) {
-            playerData.homeRunParks[hrId] = analysisResult.total_dongs;
+        while (!this.shuttingDown &&
+            !terminalStatcastFailure &&
+            !terminalAnalysisFailure &&
+            !this.isUsableAnalysisResult(analysisResult, statcastData) &&
+            attemptsThisRun < 2) {
+            attemptsThisRun++;
+            statcastData = await this.getStatcastDataForHR(playerId, record.hrDetail);
+            if (!statcastData) break;
+            if (statcastData) {
+                if (this.analysisPermanentlyUnavailable) {
+                    analysisError = 'Statcast is available; park analysis is unavailable on this bot instance.';
+                    break;
+                }
+                try {
+                    analysisResult = await this.runHRAnalysis(
+                        statcastData,
+                        playerData.name,
+                        playerId,
+                        record.hrId
+                    );
+                } catch (error) {
+                    if (this.analysisPermanentlyUnavailable) {
+                        analysisError = 'Statcast is available; park analysis is unavailable on this bot instance.';
+                        break;
+                    }
+                    this.logEvent('warn', 'analysis_retryable_failure', {
+                        jobId: jobKey,
+                        playerId,
+                        eventId: record.hrId,
+                        error: error.message
+                    });
+                    if (attemptsThisRun < 2) {
+                        await this.sleep(30000);
+                    }
+                    continue;
+                }
+                if (this.isUsableAnalysisResult(analysisResult, statcastData)) {
+                    playerData.homeRunParks[record.hrId] =
+                        this.buildParkAnalysisRecord(analysisResult, statcastData);
+                    record.statcastData = statcastData;
+                    record.analysisResult = {
+                        ...analysisResult,
+                        image_path: null,
+                        temp_directory: null
+                    };
+                    jobKey = this.getPendingEnrichmentKey(record, jobKey);
+                    this.pendingEnrichments.set(jobKey, record);
+                    this.saveState({ throwOnError: true });
+                    break;
+                }
+                if (analysisResult?.analysis_status === 'error' || analysisResult?.permanent_error) {
+                    analysisError = analysisResult.analysis_error || 'Park analysis is unavailable for this venue.';
+                    analysisResult = null;
+                    break;
+                }
+            }
+            if (attemptsThisRun < 2) {
+                await this.sleep(30000);
+            }
         }
 
-        // Clean up temp image
-        if (analysisResult?.image_path) {
-            this.cleanupAnalysisImage(analysisResult.image_path);
+        if (record.season !== this.currentSeason) {
+            this.logEvent('info', 'enrichment_abandoned_after_season_rollover', {
+                jobId: jobKey,
+                recordSeason: record.season,
+                activeSeason: this.currentSeason
+            });
+            return;
+        }
+        if (this.shuttingDown || record.cancelledReason) {
+            return;
         }
 
-        const hadStatcast = statcastData ? 'with Statcast' : 'basic (no Statcast)';
-        this.log(`Sent combined alert ${hadStatcast} for ${playerData.name} HR ${hrId} to ${deliveryResult.successChannelIds.length} channel(s)`);
-        return true;
+        if (!statcastData) {
+            if (!terminalStatcastFailure) {
+                this.deferEnrichment(jobKey, record, 15 * 60 * 1000);
+                return;
+            }
+            record.terminalReason = 'statcast-unavailable';
+            analysisError = 'Statcast details remained unavailable; no further data retries will run.';
+            if (!record.terminalLoggedAt) {
+                record.terminalLoggedAt = this.clock().toISOString();
+                this.metrics.enrichmentsTerminal++;
+                this.logEvent('warn', 'enrichment_data_terminal', {
+                    jobId: jobKey,
+                    playerId,
+                    gameId: record.hrDetail?.gameId || null,
+                    eventId: record.hrId,
+                    ageMs,
+                    dataAttempts
+                });
+            }
+        }
+
+        let usableAnalysis = this.isUsableAnalysisResult(analysisResult, statcastData)
+            ? analysisResult
+            : null;
+        if (statcastData &&
+            !usableAnalysis &&
+            !analysisError &&
+            !this.analysisPermanentlyUnavailable) {
+            if (!terminalAnalysisFailure) {
+                record.statcastData = statcastData;
+                this.deferEnrichment(
+                    jobKey,
+                    record,
+                    15 * 60 * 1000,
+                    { kind: 'analysis' }
+                );
+                return;
+            }
+            record.terminalReason = 'analysis-unavailable';
+            analysisError =
+                'Park analysis remained unavailable; no further analysis retries will run.';
+            if (!record.terminalLoggedAt) {
+                record.terminalLoggedAt = this.clock().toISOString();
+                this.metrics.enrichmentsTerminal++;
+                this.logEvent('warn', 'enrichment_analysis_terminal', {
+                    jobId: jobKey,
+                    playerId,
+                    eventId: record.hrId,
+                    ageMs,
+                    analysisAttempts
+                });
+            }
+        }
+        let imageFooter = null;
+        if (usableAnalysis) {
+            const needsPersistedArtifact = !usableAnalysis.image_path &&
+                record.imageStatus === 'available';
+            const canRetryInitialImage = !usableAnalysis.image_path &&
+                record.imageStatus !== 'unavailable' &&
+                (record.imageRegenerationAttempts || 0) < 1;
+            if ((needsPersistedArtifact || canRetryInitialImage) &&
+                !this.analysisPermanentlyUnavailable) {
+                if (canRetryInitialImage) {
+                    record.imageRegenerationAttempts =
+                        (record.imageRegenerationAttempts || 0) + 1;
+                }
+                try {
+                    const regenerated = await this.runHRAnalysis(
+                        statcastData,
+                        playerData.name,
+                        playerId,
+                        `${record.hrId}:artifact:${record.deliveryAttempts || 0}:${record.imageRegenerationAttempts || 0}`
+                    );
+                    if (this.isUsableAnalysisResult(regenerated, statcastData) &&
+                        regenerated.image_path) {
+                        usableAnalysis = regenerated;
+                        analysisResult = regenerated;
+                        record.imageStatus = 'available';
+                    } else {
+                        record.imageStatus = 'unavailable';
+                        imageFooter = 'The park counts are available, but the overlay image could not be generated.';
+                        this.logEvent('warn', 'analysis_image_unavailable', {
+                            jobId: jobKey,
+                            playerId,
+                            eventId: record.hrId,
+                            error: regenerated?.image_error || regenerated?.analysis_error || null
+                        });
+                    }
+                } catch (error) {
+                    record.imageStatus = 'unavailable';
+                    imageFooter = 'The park counts are available, but the overlay image could not be generated.';
+                    this.logEvent('warn', 'analysis_image_regeneration_failed', {
+                        jobId: jobKey,
+                        playerId,
+                        eventId: record.hrId,
+                        error: error.message
+                    });
+                }
+            } else if (!usableAnalysis.image_path && record.imageStatus === 'unavailable') {
+                imageFooter = 'The park counts are available, but the overlay image is unavailable.';
+            } else if (usableAnalysis.image_path) {
+                record.imageStatus = 'available';
+            } else {
+                imageFooter = 'The park counts are available, but the overlay image is unavailable.';
+            }
+            record.analysisResult = {
+                ...usableAnalysis,
+                image_path: null,
+                temp_directory: null
+            };
+            record.statcastData = statcastData;
+        }
+        const footerParts = [];
+        if (usableAnalysis?.analysis_status === 'partial') {
+            footerParts.push('Park analysis is partial; unsupported parks were excluded.');
+        }
+        if (imageFooter) footerParts.push(imageFooter);
+        if (!usableAnalysis) {
+            footerParts.push(
+                analysisError ||
+                (statcastData
+                    ? 'Statcast is available, but park analysis is unavailable.'
+                    : 'Statcast details are unavailable.')
+            );
+        }
+        const footerText = footerParts.join(' ');
+        const remainingChannels = [];
+        for (const channelId of [...record.channelIds]) {
+            if (this.shuttingDown || record.cancelledReason) break;
+            try {
+                await this.updateEnrichedAlert(
+                    playerId,
+                    playerData,
+                    record,
+                    channelId,
+                    statcastData,
+                    usableAnalysis,
+                    footerText
+                );
+                this.logEvent('info', 'alert_enriched', {
+                    jobId: jobKey,
+                    playerId,
+                    gameId: record.hrDetail.gameId,
+                    eventId: record.hrId,
+                    channelId
+                });
+            } catch (error) {
+                remainingChannels.push(channelId);
+                this.logEvent('error', 'alert_enrichment_delivery_failed', {
+                    jobId: jobKey,
+                    playerId,
+                    eventId: record.hrId,
+                    channelId,
+                    error: error.message
+                });
+            }
+        }
+        if (record.cancelledReason) {
+            for (const [candidateKey, candidate] of [...this.pendingEnrichments]) {
+                if (candidate === record) {
+                    this.pendingEnrichments.delete(candidateKey);
+                }
+            }
+            return;
+        }
+        if (this.shuttingDown) {
+            return;
+        }
+
+        jobKey = this.getPendingEnrichmentKey(record, jobKey);
+        const latestRecord = this.pendingEnrichments.get(jobKey);
+        if (latestRecord && latestRecord !== record) {
+            this.mergeEnrichmentRecord(record, latestRecord);
+            this.pendingEnrichments.set(jobKey, record);
+        }
+        const pendingChannelIds = [...new Set([
+            ...remainingChannels,
+            ...(record.channelIds || []).filter(channelId => {
+                const delivery = this.getAlertDeliveryRecord(
+                    playerData,
+                    channelId,
+                    record.hrId
+                );
+                return delivery?.basicSentAt &&
+                    !delivery.enrichedAt &&
+                    !delivery.retractedAt &&
+                    !delivery.enrichmentFailedAt;
+            })
+        ])];
+        if (pendingChannelIds.length === 0) {
+            this.pendingEnrichments.delete(jobKey);
+        } else {
+            record.channelIds = pendingChannelIds;
+            record.attempts = (record.attempts || 0) + 1;
+            record.deliveryAttempts = (record.deliveryAttempts || 0) + 1;
+            if (ageMs >= this.enrichmentMaxAgeMs ||
+                record.deliveryAttempts >= this.enrichmentMaxDataAttempts) {
+                for (const channelId of pendingChannelIds) {
+                    const delivery = this.getAlertDeliveryRecord(
+                        playerData,
+                        channelId,
+                        record.hrId
+                    );
+                    if (delivery) {
+                        delivery.enrichmentFailedAt =
+                            this.clock().toISOString();
+                        delivery.enrichmentFailureReason =
+                            'Delivery retry limit reached';
+                    }
+                }
+                if (!record.deliveryTerminalLoggedAt) {
+                    record.deliveryTerminalLoggedAt =
+                        this.clock().toISOString();
+                    this.metrics.enrichmentsTerminal++;
+                    this.logEvent('error', 'enrichment_delivery_terminal', {
+                        jobId: jobKey,
+                        playerId,
+                        eventId: record.hrId,
+                        channelIds: pendingChannelIds,
+                        ageMs,
+                        deliveryAttempts: record.deliveryAttempts
+                    });
+                }
+                this.pendingEnrichments.delete(jobKey);
+            } else {
+                record.nextAttemptAt = new Date(
+                    this.clock().getTime() + 5 * 60 * 1000
+                ).toISOString();
+                this.pendingEnrichments.set(jobKey, record);
+            }
+        }
+        this.saveState({ throwOnError: true });
     }
 
     startMonitoring() {
-        cron.schedule('*/4 * * * *', async () => {
+        if (this.monitorTask || this.shuttingDown) return;
+        const runScheduledPoll = async () => {
+            this.monitorTask = null;
             try {
                 await this.checkForNewHomeRuns();
             } catch (error) {
-                this.log(`Scheduled check failed: ${error.message}`);
+                this.logEvent('error', 'scheduled_poll_failed', { error: error.message });
+            } finally {
+                this.resumePendingEnrichments();
+                this.scheduleNextPoll();
             }
+        };
+        this.scheduledPollRunner = runScheduledPoll;
+        this.logEvent('info', 'monitoring_started', {
+            pollIntervalMs: this.pollIntervalMs,
+            offseasonPollIntervalMs: this.offseasonPollIntervalMs,
+            jitterMs: this.pollJitterMs
         });
-        
-        this.log('Started monitoring for home runs from your selected star players!');
-        this.log('Checking every 4 minutes year-round so Opening Day and late-season games are not missed');
 
         if (this.startupCatchUpPlayerIds.size > 0) {
-            this.log('Running startup catch-up check now; older missed home runs will be skipped');
-            this.checkForNewHomeRuns().catch(error => {
-                this.log(`Startup catch-up check failed: ${error.message}`);
-            });
+            void runScheduledPoll();
+        } else {
+            this.scheduleNextPoll();
         }
+    }
+
+    isOffseason() {
+        const month = this.clock().getUTCMonth();
+        return month === 10 || month === 11 || month === 0 || month === 1;
+    }
+
+    scheduleNextPoll() {
+        if (this.shuttingDown || this.monitorTask) return;
+        const baseDelay = this.isOffseason()
+            ? this.offseasonPollIntervalMs
+            : this.pollIntervalMs;
+        const jitter = this.pollJitterMs > 0
+            ? Math.floor(this.random() * (this.pollJitterMs + 1))
+            : 0;
+        this.monitorTask = setTimeout(this.scheduledPollRunner, baseDelay + jitter);
     }
 
     async handleCommand(message) {
@@ -1422,44 +5764,9 @@ class BaseballBot {
         const parts = content.split(/\s+/);
         const command = parts[0];
         const args = parts.slice(1);
-
-        if (command === '!judge') {
-            await this.sendPlayerStats('592450', message);
-            return;
-        }
-
-        if (command === '!rice') {
-            await this.sendPlayerStats('700250', message);
-            return;
-        }
-
-        if (command === '!soto') {
-            await this.sendPlayerStats('665742', message);
-            return;
-        }
-
-        if (command === '!ohtani') {
-            await this.sendPlayerStats('660271', message);
-            return;
-        }
-
-        if (command === '!schwarber') {
-            await this.sendPlayerStats('656941', message);
-            return;
-        }
-
-        if (command === '!harper') {
-            await this.sendPlayerStats('547180', message);
-            return;
-        }
-
-        if (command === '!gunnar') {
-            await this.sendPlayerStats('683002', message);
-            return;
-        }
-
-        if (command === '!trout') {
-            await this.sendPlayerStats('545361', message);
+        const shortcutPlayerId = this.getPlayerShortcutCommands().get(command);
+        if (shortcutPlayerId) {
+            await this.sendPlayerStats(shortcutPlayerId, message);
             return;
         }
 
@@ -1483,14 +5790,7 @@ class BaseballBot {
             '!testhr',
             '!debug',
             '!forcecheck',
-            '!reset',
-            '!testdetails',
-            '!testrbi',
-            '!testdistance',
-            '!debuggame',
-            '!testgame',
-            '!findrecent',
-            '!teststatcast'
+            '!reset'
         ]);
 
         if (adminCommands.has(command) && !(await this.ensureAdmin(message))) {
@@ -1509,8 +5809,13 @@ class BaseballBot {
 
         if (command === '!forcecheck') {
             await message.reply('Running manual home run check...');
-            await this.checkForNewHomeRuns();
-            await message.reply('Manual check completed! Check console logs for details.');
+            const result = await this.checkForNewHomeRuns({ force: true });
+            await message.reply(
+                `Manual check finished: ${result.detected} HR detected, ` +
+                `${result.alertsDelivered} basic alert delivery(s), ${result.alertFailures} delivery failure(s), ` +
+                `${result.enrichmentsQueued} enrichment job(s) queued, ${result.playersFailed} player(s) unavailable, ` +
+                `${result.pendingEnrichments} enrichment job(s) pending.`
+            );
             return;
         }
 
@@ -1524,72 +5829,6 @@ class BaseballBot {
             await this.resetPlayerHR(playerName, message);
             return;
         }
-
-        if (command === '!testdetails') {
-            const playerName = args.join(' ');
-            if (!playerName) {
-                await message.reply('Usage: !testdetails [playerName]');
-                return;
-            }
-
-            await this.testHomeRunDetails(playerName, message);
-            return;
-        }
-
-        if (command === '!testrbi') {
-            const playerName = args.join(' ');
-            if (!playerName) {
-                await message.reply('Usage: !testrbi [playerName]');
-                return;
-            }
-
-            await this.testRBIDetection(playerName, message);
-            return;
-        }
-
-        if (command === '!testdistance') {
-            const playerName = args.join(' ');
-            if (!playerName) {
-                await message.reply('Usage: !testdistance [playerName]');
-                return;
-            }
-
-            await this.testDistanceData(playerName, message);
-            return;
-        }
-
-        if (command === '!debuggame') {
-            if (args.length < 2) {
-                await message.reply('Usage: !debuggame [gameId] [playerName]');
-                return;
-            }
-
-            const gameId = args[0];
-            const playerName = args.slice(1).join(' ');
-            await this.debugSpecificGame(gameId, playerName, message);
-            return;
-        }
-
-        if (command === '!testgame') {
-            if (args.length < 2) {
-                await message.reply('Usage: !testgame [gameId] [playerName]');
-                return;
-            }
-
-            const gameId = args[0];
-            const playerName = args.slice(1).join(' ');
-            await this.testSpecificGame(gameId, playerName, message);
-            return;
-        }
-
-        if (command === '!findrecent') {
-            await this.findRecentHomeRunsWithDistance(message);
-            return;
-        }
-
-        if (command === '!teststatcast') {
-            await this.testEnhancedStatcast(message);
-        }
     }
 
     async sendDebugInfo(message) {
@@ -1597,14 +5836,27 @@ class BaseballBot {
             const debugInfo = [];
             debugInfo.push(`**Bot Status:**`);
             debugInfo.push(`- Last check: ${this.lastCheckTime ? this.lastCheckTime.toISOString() : 'Never'}`);
+            debugInfo.push(`- Last fully successful poll: ${this.lastSuccessfulPollAt ? this.lastSuccessfulPollAt.toISOString() : 'Never'}`);
             debugInfo.push(`- Current season: ${this.currentSeason}`);
-            debugInfo.push(`- Debugging enabled: ${this.debugging}`);
             debugInfo.push(`- Alert channels: ${this.channelIds.length} (${this.channelIds.join(', ')})`);
+            debugInfo.push(`- Polls: ${this.metrics.checksSucceeded} succeeded / ${this.metrics.checksFailed} degraded or failed`);
+            debugInfo.push(`- Alerts: ${this.metrics.detected} detected / ${this.metrics.delivered} delivered / ${this.metrics.failed} failed`);
+            const oldestPendingTimestamp = Math.min(...[...this.pendingEnrichments.values()]
+                .map(record => Date.parse(record.createdAt))
+                .filter(Number.isFinite));
+            const oldestPending = Number.isFinite(oldestPendingTimestamp)
+                ? this.formatSnapshotAge(new Date(oldestPendingTimestamp).toISOString())
+                : 'N/A';
+            debugInfo.push(`- Enrichment queue: ${this.pendingEnrichments.size} pending (oldest: ${oldestPending})`);
             debugInfo.push(`\n**Player Tracking:**`);
-            
+
             for (const [playerId, playerData] of Object.entries(this.players)) {
-                const currentHR = await this.getPlayerHomeRuns(playerId);
-                debugInfo.push(`- ${playerData.name}: Tracked=${playerData.lastCheckedHR}, Current=${currentHR}`);
+                const snapshot = await this.getPlayerStatsForDisplay(playerId);
+                const currentHR = this.getSeasonHomeRunTotal(snapshot.stats);
+                const liveText = currentHR === null
+                    ? 'Unavailable'
+                    : `${currentHR}${snapshot.stale ? ` (stale, ${this.formatSnapshotAge(snapshot.fetchedAt)})` : ''}`;
+                debugInfo.push(`- ${playerData.name}: Tracked=${playerData.lastCheckedHR}, Current=${liveText}`);
             }
 
             const embed = new Discord.EmbedBuilder()
@@ -1622,867 +5874,158 @@ class BaseballBot {
 
     async resetPlayerHR(playerName, message) {
         try {
-            const playerId = this.findPlayerIdByName(playerName);
-            
+            const resolution = this.resolvePlayerByName(playerName);
+            const playerId = resolution.playerId;
+
             if (!playerId) {
-                await message.reply(`Player "${playerName}" not found!`);
+                await message.reply(this.formatPlayerResolutionError(playerName, resolution));
                 return;
             }
-            
-            const oldValue = this.players[playerId].lastCheckedHR;
-            this.players[playerId].lastCheckedHR = 0;
-            this.players[playerId].sentHomeRuns.clear();
-            this.players[playerId].sentHomeRunsByChannel = {};
-            this.ensurePlayerDeliveryState(this.players[playerId]);
-            this.saveState();
-            this.log(`Reset ${this.players[playerId].name} HR count from ${oldValue} to 0 and cleared sent home runs (manual reset)`);
-            
-            await message.reply(`Reset ${this.players[playerId].name}'s tracked HR count from ${oldValue} to 0 and cleared sent home runs. Next check will detect any current HRs as new.`);
+
+            if (this.checkInProgress) {
+                await this.checkInProgress;
+            }
+            const releasePlayerMutation = await this.acquireKeyedLock(
+                this.playerMutationLocks,
+                playerId
+            );
+            try {
+            const currentTotal = await this.getPlayerHomeRunTotal(playerId);
+            if (currentTotal === null) {
+                await message.reply('The live MLB total is unavailable, so no tracking state was changed.');
+                return;
+            }
+            const playerData = this.players[playerId];
+            const currentDetails = currentTotal > 0
+                ? await this.getRecentHomeRunDetails(
+                    playerId,
+                    currentTotal,
+                    { force: true }
+                )
+                : [];
+            const confirmedTotal = await this.getPlayerHomeRunTotal(playerId);
+            if (confirmedTotal !== currentTotal) {
+                await message.reply(
+                    'MLB data changed while the reset snapshot was being reconstructed, so no tracking state was changed.'
+                );
+                return;
+            }
+            const eventIds = await this.reconcileAuthoritativeInventory(
+                playerId,
+                playerData,
+                currentDetails,
+                currentTotal,
+                { persist: false }
+            );
+            if (!eventIds) {
+                await message.reply(
+                    'The complete current home-run inventory is unavailable, so no tracking state was changed.'
+                );
+                return;
+            }
+            const oldValue = playerData.lastCheckedHR;
+            playerData.lastCheckedHR = currentTotal;
+            playerData.checkpointInitialized = true;
+            playerData.lowerTotalObservation = null;
+            playerData.inventoryCorrectionCandidate = null;
+            playerData.baselineHomeRunIds = new Set(eventIds);
+            playerData.baselineSnapshotInitialized = true;
+            try {
+                this.saveState({ throwOnError: true });
+            } catch (error) {
+                this.scheduleFatalShutdown(
+                    'manual-resync-persistence-failed',
+                    error
+                );
+                throw error;
+            }
+            this.logEvent('info', 'player_checkpoint_resynchronized', {
+                playerId,
+                player: playerData.name,
+                previousCheckpoint: oldValue,
+                currentTotal
+            });
+
+            await message.reply(
+                `Resynchronized ${playerData.name}'s checkpoint from ${oldValue} to the live total (${currentTotal}). ` +
+                'Previously delivered alert history was preserved; historical alerts will not replay.'
+            );
+            } finally {
+                releasePlayerMutation();
+            }
         } catch (error) {
             this.log(`Error in reset command: ${error.message}`);
             await message.reply('Error resetting player HR count!');
         }
     }
 
-    async testHomeRunDetails(playerName, message) {
-        try {
-            const playerId = this.findPlayerIdByName(playerName);
-            
-            if (!playerId) {
-                await message.reply(`Player "${playerName}" not found!`);
-                return;
-            }
-            
-            const playerData = this.players[playerId];
-            await message.reply(`🔍 Testing home run details fetching for ${playerData.name}...`);
-            
-            // Test primary method with detailed debugging
-            await message.reply(`📊 Testing primary method (game feed API)...`);
-            const primaryDetails = await this.getRecentHomeRunDetails(playerId, 1);
-            const firstDetail = Array.isArray(primaryDetails) ? primaryDetails[0] : primaryDetails;
-            await message.reply(`Primary method results for ${playerData.name}:\nDistance: ${firstDetail.distance}\nRBI: ${firstDetail.rbi}\nType: ${firstDetail.rbiDescription}`);
-            
-            // Test alternative method
-            await message.reply(`📊 Testing alternative method (game log API)...`);
-            const alternativeDetails = await this.getHomeRunDetailsFromAlternativeAPI(playerId);
-            await message.reply(`Alternative method results for ${playerData.name}:\nDistance: ${alternativeDetails.distance}\nRBI: ${alternativeDetails.rbi}\nType: ${alternativeDetails.rbiDescription}`);
-            
-            // Test current season stats to see if player has any home runs
-            await message.reply(`📊 Checking current season stats...`);
-            const currentHR = await this.getPlayerHomeRuns(playerId);
-            await message.reply(`Current season home runs for ${playerData.name}: ${currentHR}`);
-            
-            // Test raw API response for debugging
-            await this.testRawAPIResponse(playerId, message);
-            
-        } catch (error) {
-            this.log(`Error in test details command: ${error.message}`);
-            await message.reply('Error testing home run details!');
-        }
-    }
+    getParksBreakdown(homeRunParks) {
+        const counts = { noDoubter: 0, tier80: 0, tier60: 0, tier40: 0, under40: 0 };
+        const records = Object.values(homeRunParks || {})
+            .filter(value => this.isCurrentParkAnalysisRecord(value))
+            .map(value => this.normalizeParkAnalysisRecord(value))
+            .filter(Boolean);
 
-    async testRawAPIResponse(playerId, message) {
-        try {
-            const playerData = this.players[playerId];
-            await message.reply(`🔍 Testing raw API responses for ${playerData.name}...`);
-            
-            // Test game log API
-            try {
-                const gamesResponse = await axios.get(
-                    `https://statsapi.mlb.com/api/v1/people/${playerId}/gameLog?season=${this.currentSeason}&gameType=R&limit=5`
-                );
-                
-                await message.reply(`🔗 API URL tested: https://statsapi.mlb.com/api/v1/people/${playerId}/gameLog?season=${this.currentSeason}&gameType=R&limit=5`);
-                
-                if (gamesResponse.data.dates && gamesResponse.data.dates.length > 0) {
-                    const recentGames = gamesResponse.data.dates.slice(0, 2); // Just check first 2 dates
-                    await message.reply(`📊 Found ${recentGames.length} recent game dates for ${playerData.name}`);
-                    
-                    for (let i = 0; i < recentGames.length; i++) {
-                        const date = recentGames[i];
-                        await message.reply(`📅 Date ${i+1}: ${date.date} - ${date.games.length} games`);
-                        
-                        if (date.games.length > 0) {
-                            const game = date.games[0]; // Check first game of each date
-                            await message.reply(`🎮 Game ID: ${game.gameId}, Home: ${game.teams.home.team.name}, Away: ${game.teams.away.team.name}`);
-                            
-                            // Try to get game feed data
-                            try {
-                                const gameFeedResponse = await axios.get(
-                                    `https://statsapi.mlb.com/api/v1/game/${game.gameId}/feed/live`
-                                );
-                                
-                                if (gameFeedResponse.data.liveData && gameFeedResponse.data.liveData.plays) {
-                                    const allPlays = gameFeedResponse.data.liveData.plays.allPlays;
-                                    await message.reply(`📋 Game has ${allPlays.length} total plays`);
-                                    
-                                    // Look for any home runs in this game
-                                    const homeRunPlays = allPlays.filter(play => 
-                                        play.result && 
-                                        (play.result.event === 'Home Run' || 
-                                         play.result.eventType === 'home_run' ||
-                                         (play.result.description && play.result.description.toLowerCase().includes('home run')))
-                                    );
-                                    
-                                    await message.reply(`⚾ Found ${homeRunPlays.length} home run plays in this game`);
-                                    
-                                    if (homeRunPlays.length > 0) {
-                                        const samplePlay = homeRunPlays[0];
-                                        await message.reply(`📊 Sample home run play structure:`);
-                                        await message.reply(`Event: ${samplePlay.result?.event || 'N/A'}`);
-                                        await message.reply(`EventType: ${samplePlay.result?.eventType || 'N/A'}`);
-                                        await message.reply(`Description: ${samplePlay.result?.description || 'N/A'}`);
-                                        await message.reply(`RBI: ${samplePlay.result?.rbi || 'N/A'}`);
-                                        
-                                        if (samplePlay.hitData) {
-                                            await message.reply(`HitData keys: ${Object.keys(samplePlay.hitData).join(', ')}`);
-                                            if (samplePlay.hitData.totalDistance) {
-                                                await message.reply(`TotalDistance: ${samplePlay.hitData.totalDistance}`);
-                                            }
-                                            if (samplePlay.hitData.distance) {
-                                                await message.reply(`Distance: ${samplePlay.hitData.distance}`);
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    await message.reply(`❌ No live data available for this game`);
-                                }
-                            } catch (gameFeedError) {
-                                await message.reply(`❌ Error fetching game feed: ${gameFeedError.message}`);
-                            }
-                        }
-                    }
-                } else {
-                    await message.reply(`❌ No recent games found for ${playerData.name}`);
-                }
-            } catch (gamesError) {
-                await message.reply(`❌ Error fetching game log: ${gamesError.message}`);
-            }
-            
-            // Test the alternative API that's working
-            await message.reply(`🔍 Testing the working alternative API...`);
-            try {
-                const altResponse = await axios.get(
-                    `https://statsapi.mlb.com/api/v1/people/${playerId}/stats?stats=gameLog&season=${this.currentSeason}&group=hitting&gameType=R`
-                );
-                
-                await message.reply(`✅ Alternative API successful! Found ${altResponse.data.stats ? altResponse.data.stats.length : 0} stat entries`);
-                
-                if (altResponse.data.stats && altResponse.data.stats[0] && altResponse.data.stats[0].splits) {
-                    const gamesWithHR = altResponse.data.stats[0].splits.filter(game => game.stat.homeRuns > 0);
-                    await message.reply(`⚾ Found ${gamesWithHR.length} games with home runs`);
-                    
-                    if (gamesWithHR.length > 0) {
-                        const mostRecent = gamesWithHR[0];
-                        await message.reply(`📊 Most recent HR game: ${mostRecent.date}`);
-                        await message.reply(`Game ID: ${mostRecent.gameId || 'Not available'}`);
-                        await message.reply(`Home Runs: ${mostRecent.stat.homeRuns}`);
-                        await message.reply(`RBI: ${mostRecent.stat.rbi}`);
-                        
-                        // Debug the game object structure
-                        await message.reply(`🔍 Game object keys: ${Object.keys(mostRecent).join(', ')}`);
-                        if (mostRecent.game) {
-                            await message.reply(`📊 Game sub-object keys: ${Object.keys(mostRecent.game).join(', ')}`);
-                        }
-                        
-                        // Try to get detailed game data for this specific game
-                        const gameId = mostRecent.gameId || mostRecent.game?.gameId;
-                        if (gameId) {
-                            await message.reply(`🔍 Attempting to get detailed game data for ${gameId}...`);
-                            try {
-                                const gameDetailResponse = await axios.get(
-                                    `https://statsapi.mlb.com/api/v1/game/${gameId}/feed/live`
-                                );
-                            
-                            if (gameDetailResponse.data.liveData && gameDetailResponse.data.liveData.plays) {
-                                const allPlays = gameDetailResponse.data.liveData.plays.allPlays;
-                                const homeRunPlays = allPlays.filter(play => 
-                                    play.result && 
-                                    (play.result.event === 'Home Run' || 
-                                     play.result.eventType === 'home_run' ||
-                                     (play.result.description && play.result.description.toLowerCase().includes('home run'))) &&
-                                    play.matchup && play.matchup.batter && 
-                                    play.matchup.batter.id.toString() === playerId
-                                );
-                                
-                                await message.reply(`📋 Found ${homeRunPlays.length} home runs by ${playerData.name} in this game`);
-                                
-                                if (homeRunPlays.length > 0) {
-                                    const hrPlay = homeRunPlays[0];
-                                    await message.reply(`📊 Home run play details:`);
-                                    await message.reply(`Event: ${hrPlay.result?.event || 'N/A'}`);
-                                    await message.reply(`Description: ${hrPlay.result?.description || 'N/A'}`);
-                                    await message.reply(`RBI: ${hrPlay.result?.rbi || 'N/A'}`);
-                                    
-                                    if (hrPlay.hitData) {
-                                        await message.reply(`HitData available: ${Object.keys(hrPlay.hitData).join(', ')}`);
-                                        if (hrPlay.hitData.totalDistance) {
-                                            await message.reply(`✅ TotalDistance: ${hrPlay.hitData.totalDistance} ft`);
-                                        }
-                                        if (hrPlay.hitData.distance) {
-                                            await message.reply(`✅ Distance: ${hrPlay.hitData.distance} ft`);
-                                        }
-                                    } else {
-                                        await message.reply(`❌ No hitData available for this play`);
-                                    }
-                                }
-                            } else {
-                                await message.reply(`❌ No live data available for game ${mostRecent.gameId}`);
-                            }
-                        } catch (gameDetailError) {
-                            await message.reply(`❌ Error fetching game details: ${gameDetailError.message}`);
-                        }
-                    } else {
-                        await message.reply(`❌ No valid game ID found for detailed data`);
-                    }
-                }
-                }
-            } catch (altError) {
-                await message.reply(`❌ Error with alternative API: ${altError.message}`);
-            }
-            
-        } catch (error) {
-            this.log(`Error in test raw API response: ${error.message}`);
-            await message.reply('Error testing raw API response!');
-        }
-    }
-
-    async testRBIDetection(playerName, message) {
-        try {
-            const playerId = Object.keys(this.players).find(id => 
-                this.players[id].name.toLowerCase().includes(playerName.toLowerCase())
-            );
-            
-            if (!playerId) {
-                await message.reply(`Player "${playerName}" not found!`);
-                return;
-            }
-            
-            const playerData = this.players[playerId];
-            await message.reply(`🔍 Testing RBI detection for ${playerData.name}...`);
-            
-            // Get current season stats first
-            const stats = await this.getPlayerStats(playerId);
-            if (stats) {
-                await message.reply(`📊 ${playerData.name} season stats:\nHR: ${stats.homeRuns || 0}\nRBI: ${stats.rbi || 0}\nAVG: ${stats.avg || 'N/A'}`);
-            }
-            
-            // Try to get recent game-by-game RBI data
-            try {
-                const response = await axios.get(
-                    `https://statsapi.mlb.com/api/v1/people/${playerId}/stats?stats=gameLog&season=${this.currentSeason}&group=hitting&gameType=R`
-                );
-                
-                if (response.data.stats && response.data.stats[0] && response.data.stats[0].splits) {
-                    const games = response.data.stats[0].splits
-                        .filter(game => game.stat.homeRuns > 0) // Only games with home runs
-                        .sort((a, b) => new Date(b.date) - new Date(a.date))
-                        .slice(0, 5); // Last 5 games with HRs
-                    
-                    if (games.length > 0) {
-                        await message.reply(`⚾ Found ${games.length} recent games with home runs:`);
-                        
-                        for (const game of games) {
-                            const rbi = game.stat.rbi || 0;
-                            const hr = game.stat.homeRuns || 0;
-                            const rbiDescription = this.getRbiDescription(rbi);
-                            
-                            await message.reply(`📅 ${game.date}: ${hr} HR, ${rbi} RBI (${rbiDescription})`);
-                        }
-                        
-                        // Test the most recent home run game
-                        const mostRecent = games[0];
-                        await message.reply(`🔍 Testing most recent HR game (${mostRecent.date}):`);
-                        await message.reply(`Game ID: ${mostRecent.gameId}`);
-                        await message.reply(`Home Runs: ${mostRecent.stat.homeRuns}`);
-                        await message.reply(`RBI: ${mostRecent.stat.rbi}`);
-                        await message.reply(`RBI Description: ${this.getRbiDescription(mostRecent.stat.rbi)}`);
-                        
-                    } else {
-                        await message.reply(`❌ No games with home runs found for ${playerData.name} this season`);
-                    }
-                } else {
-                    await message.reply(`❌ No game log data available for ${playerData.name}`);
-                }
-            } catch (error) {
-                await message.reply(`❌ Error fetching game log: ${error.message}`);
-            }
-            
-        } catch (error) {
-            this.log(`Error in test RBI detection: ${error.message}`);
-            await message.reply('Error testing RBI detection!');
-        }
-    }
-
-    async testDistanceData(playerName, message) {
-        try {
-            const playerId = Object.keys(this.players).find(id => 
-                this.players[id].name.toLowerCase().includes(playerName.toLowerCase())
-            );
-            
-            if (!playerId) {
-                await message.reply(`Player "${playerName}" not found!`);
-                return;
-            }
-            
-            const playerData = this.players[playerId];
-            await message.reply(`🔍 Testing distance data for ${playerData.name}...`);
-            
-            // Get recent home run game
-            try {
-                const response = await axios.get(
-                    `https://statsapi.mlb.com/api/v1/people/${playerId}/stats?stats=gameLog&season=${this.currentSeason}&group=hitting&gameType=R`
-                );
-                
-                if (response.data.stats && response.data.stats[0] && response.data.stats[0].splits) {
-                    const gamesWithHR = response.data.stats[0].splits
-                        .filter(game => game.stat.homeRuns > 0)
-                        .sort((a, b) => new Date(b.date) - new Date(a.date))
-                        .slice(0, 3); // Test last 3 HR games
-                    
-                    if (gamesWithHR.length > 0) {
-                        await message.reply(`⚾ Testing distance data for ${gamesWithHR.length} recent home run games:`);
-                        
-                        for (const game of gamesWithHR) {
-                            await message.reply(`📅 Game: ${game.date} (ID: ${game.gameId})`);
-                            
-                            // Test Statcast distance
-                            const statcastDistance = await this.getHomeRunDetailsFromStatcast(playerId, game.gameId);
-                            await message.reply(`📊 Statcast Distance: ${statcastDistance.distance}`);
-                            await message.reply(`📊 Statcast RBI: ${statcastDistance.rbi} (${statcastDistance.rbiDescription})`);
-                            
-                            // Test game feed distance
-                            try {
-                                const gameFeedResponse = await axios.get(
-                                    `https://statsapi.mlb.com/api/v1/game/${game.gameId}/feed/live`
-                                );
-                                
-                                if (gameFeedResponse.data.liveData && gameFeedResponse.data.liveData.plays) {
-                                    const homeRunPlays = gameFeedResponse.data.liveData.plays.allPlays.filter(play => 
-                                        play.result && 
-                                        (play.result.event === 'Home Run' || 
-                                         play.result.eventType === 'home_run' ||
-                                         (play.result.description && play.result.description.toLowerCase().includes('home run'))) &&
-                                        play.matchup && play.matchup.batter && 
-                                        play.matchup.batter.id.toString() === playerId
-                                    );
-                                    
-                                    if (homeRunPlays.length > 0) {
-                                        const hrPlay = homeRunPlays[0];
-                                        let gameFeedDistance = "Not available";
-                                        
-                                        if (hrPlay.hitData && hrPlay.hitData.totalDistance) {
-                                            gameFeedDistance = `${hrPlay.hitData.totalDistance} ft`;
-                                        } else if (hrPlay.hitData && hrPlay.hitData.distance) {
-                                            gameFeedDistance = `${hrPlay.hitData.distance} ft`;
-                                        } else if (hrPlay.result && hrPlay.result.description && hrPlay.result.description.includes('ft')) {
-                                            const distanceMatch = hrPlay.result.description.match(/(\d+)\s*ft/);
-                                            if (distanceMatch) {
-                                                gameFeedDistance = `${distanceMatch[1]} ft`;
-                                            }
-                                        }
-                                        
-                                        await message.reply(`📊 Game Feed Distance: ${gameFeedDistance}`);
-                                    }
-                                }
-                            } catch (gameFeedError) {
-                                await message.reply(`❌ Game feed error: ${gameFeedError.message}`);
-                            }
-                            
-                            await message.reply(`---`);
-                        }
-                    } else {
-                        await message.reply(`❌ No home run games found for ${playerData.name} this season`);
-                    }
-                }
-            } catch (error) {
-                await message.reply(`❌ Error: ${error.message}`);
-            }
-            
-        } catch (error) {
-            this.log(`Error in test distance data: ${error.message}`);
-            await message.reply('Error testing distance data!');
-        }
-    }
-
-    // Add this debug method to test with a specific game
-    async debugTestSpecificGame(gameId, playerId) {
-        try {
-            console.log(`\n🔍 Testing game ${gameId} for player ${playerId}...\n`);
-            
-            // Try playByPlay endpoint
-            const response = await axios.get(
-                `https://statsapi.mlb.com/api/v1/game/${gameId}/playByPlay`
-            );
-            
-            const plays = response.data.allPlays || [];
-            console.log(`Found ${plays.length} plays in game`);
-            
-            let homeRunCount = 0;
-            for (const play of plays) {
-                if (this.isHomeRunByPlayer(play, playerId)) {
-                    homeRunCount++;
-                    console.log(`\n⚾ Home Run #${homeRunCount}:`);
-                    console.log(`Description: ${play.result?.description}`);
-                    
-                    // Check playEvents
-                    if (play.playEvents) {
-                        console.log(`PlayEvents count: ${play.playEvents.length}`);
-                        for (let i = 0; i < play.playEvents.length; i++) {
-                            const event = play.playEvents[i];
-                            if (event.hitData) {
-                                console.log(`Event ${i} hitData:`, event.hitData);
-                            }
-                        }
-                    }
-                    
-                    const distance = this.extractDistanceFromPlay(play);
-                    const rbiInfo = this.extractRBIInfo(play);
-                    
-                    console.log(`Extracted Distance: ${distance}`);
-                    console.log(`Extracted RBI: ${rbiInfo.rbi} (${rbiInfo.rbiDescription})`);
-                }
-            }
-            
-            if (homeRunCount === 0) {
-                console.log('No home runs found for this player in this game');
-            }
-            
-        } catch (error) {
-            console.error(`Error testing game: ${error.message}`);
-        }
-    }
-
-    async debugSpecificGame(gameId, playerName, message) {
-        try {
-            const playerId = Object.keys(this.players).find(id => 
-                this.players[id].name.toLowerCase().includes(playerName.toLowerCase())
-            );
-            
-            if (!playerId) {
-                await message.reply(`Player "${playerName}" not found!`);
-                return;
-            }
-            
-            const playerData = this.players[playerId];
-            await message.reply(`🔍 Debugging game ${gameId} for ${playerData.name}...`);
-            
-            // Call the debug method
-            await this.debugTestSpecificGame(gameId, playerId);
-            
-            await message.reply(`✅ Debug complete! Check console for detailed output.`);
-            
-        } catch (error) {
-            this.log(`Error in debug specific game: ${error.message}`);
-            await message.reply('Error debugging specific game!');
-        }
-    }
-
-    async testSpecificGame(gameId, playerName, message) {
-        try {
-            const playerId = Object.keys(this.players).find(id => 
-                this.players[id].name.toLowerCase().includes(playerName.toLowerCase())
-            );
-            
-            if (!playerId) {
-                await message.reply(`Player "${playerName}" not found!`);
-                return;
-            }
-            
-            await message.reply(`🔍 Testing game ${gameId} for ${this.players[playerId].name}...`);
-            
-            // Use the debug method
-            await this.debugTestSpecificGame(gameId, playerId);
-            
-            // Also test the actual extraction
-            const response = await axios.get(
-                `https://statsapi.mlb.com/api/v1/game/${gameId}/playByPlay`
-            );
-            
-            const plays = response.data.allPlays || [];
-            let found = false;
-            
-            for (const play of plays) {
-                if (this.isHomeRunByPlayer(play, playerId)) {
-                    found = true;
-                    const distance = this.extractDistanceFromPlay(play);
-                    const rbiInfo = this.extractRBIInfo(play);
-                    
-                    const embed = new Discord.EmbedBuilder()
-                        .setTitle(`⚾ Home Run Found!`)
-                        .setDescription(play.result?.description || 'No description')
-                        .addFields(
-                            { name: 'Distance', value: distance, inline: true },
-                            { name: 'RBI', value: `${rbiInfo.rbi} (${rbiInfo.rbiDescription})`, inline: true },
-                            { name: 'Game ID', value: gameId.toString(), inline: true }
-                        )
-                        .setColor('#00FF00')
-                        .setTimestamp();
-                    
-                    await message.reply({ embeds: [embed] });
-                }
-            }
-            
-            if (!found) {
-                await message.reply(`No home runs found for ${this.players[playerId].name} in game ${gameId}`);
-            }
-            
-        } catch (error) {
-            await message.reply(`Error testing game: ${error.message}`);
-        }
-    }
-
-    async findRecentHomeRunsWithDistance(message) {
-        try {
-            await message.reply('🔍 Finding recent home runs with distance data...');
-            
-            const results = [];
-            
-            for (const [playerId, playerData] of Object.entries(this.players)) {
-                const response = await axios.get(
-                    `https://statsapi.mlb.com/api/v1/people/${playerId}/stats?stats=gameLog&season=${this.currentSeason}&group=hitting&gameType=R`
-                );
-                
-                if (response.data.stats?.[0]?.splits) {
-                    const hrGame = response.data.stats[0].splits
-                        .find(game => game.stat.homeRuns > 0);
-                    
-                    if (hrGame) {
-                        const gameId = hrGame.game?.gamePk;
-                        if (gameId) {
-                            try {
-                                const details = await this.getRecentHomeRunDetails(playerId, 1);
-                                const firstDetail = Array.isArray(details) ? details[0] : details;
-                                results.push({
-                                    player: playerData.name,
-                                    date: hrGame.date,
-                                    gameId: gameId,
-                                    distance: firstDetail.distance,
-                                    rbi: firstDetail.rbiDescription
-                                });
-                            } catch (err) {
-                                this.log(`Error getting details for ${playerData.name}: ${err.message}`);
-                            }
-                        }
-                    }
-                }
-                
-                // Rate limit
-                await new Promise(resolve => setTimeout(resolve, 1000));
-            }
-            
-            if (results.length > 0) {
-                const embed = new Discord.EmbedBuilder()
-                    .setTitle('🏆 Recent Home Runs with Distance Data')
-                    .setColor('#FFD700')
-                    .setTimestamp();
-                
-                results.forEach(r => {
-                    embed.addFields({
-                        name: `${r.player} - ${r.date}`,
-                        value: `Distance: ${r.distance}\nType: ${r.rbi}\nGame: ${r.gameId}`,
-                        inline: false
-                    });
-                });
-                
-                await message.reply({ embeds: [embed] });
+        for (const record of records) {
+            const ratio = record.parksCleared / record.parksEvaluated;
+            if (record.parksCleared === record.parksEvaluated) {
+                counts.noDoubter++;
+            } else if (ratio >= 0.8) {
+                counts.tier80++;
+            } else if (ratio >= 0.6) {
+                counts.tier60++;
+            } else if (ratio >= 0.4) {
+                counts.tier40++;
             } else {
-                await message.reply('No recent home runs found with distance data');
+                counts.under40++;
             }
-            
-        } catch (error) {
-            await message.reply(`Error finding recent home runs: ${error.message}`);
         }
+
+        return { total: records.length, counts };
     }
 
-    async getStatcastFromPlayByPlay(playerId, season) {
-        try {
-            // Step 1: Find most recent HR game from game log
-            const logResp = await axios.get(
-                `https://statsapi.mlb.com/api/v1/people/${playerId}/stats?stats=gameLog&season=${season}&group=hitting&gameType=R`
-            );
-            if (!logResp.data.stats?.[0]?.splits) return null;
-
-            const hrGames = logResp.data.stats[0].splits
-                .filter(g => g.stat.homeRuns > 0)
-                .sort((a, b) => new Date(b.date) - new Date(a.date));
-
-            if (hrGames.length === 0) return null;
-
-            // Step 2: Get play-by-play data for the most recent HR game
-            const gamePk = hrGames[0].game?.gamePk;
-            const gameDate = hrGames[0].date;
-            if (!gamePk) return null;
-
-            const pbpResp = await axios.get(
-                `https://statsapi.mlb.com/api/v1/game/${gamePk}/playByPlay`
-            );
-            const plays = pbpResp.data.allPlays || [];
-
-            // Find the HR play by this batter
-            let hitData = null;
-            let pitcherName = 'Unknown';
-            let plateZ = 3.5;
-            let rbi = 1;
-            for (const play of plays) {
-                if (play.result?.event === 'Home Run' &&
-                    play.matchup?.batter?.id?.toString() === playerId) {
-                    pitcherName = play.matchup.pitcher?.fullName || 'Unknown';
-                    rbi = play.result?.rbi || 1;
-                    // hitData and plate_z are inside playEvents
-                    for (const evt of (play.playEvents || [])) {
-                        if (evt.hitData) {
-                            hitData = evt.hitData;
-                        }
-                        // Get plate_z from the pitch that was hit
-                        if (evt.pitchData?.coordinates?.pZ) {
-                            plateZ = evt.pitchData.coordinates.pZ;
-                        }
-                    }
-                    if (hitData) break;
-                }
-            }
-
-            if (!hitData || !hitData.launchSpeed || !hitData.coordinates) return null;
-
-            // Step 3: Get home/away teams from boxscore
-            let homeTeam = '';
-            let awayTeam = '';
-            try {
-                const boxResp = await axios.get(
-                    `https://statsapi.mlb.com/api/v1/game/${gamePk}/boxscore`
-                );
-                homeTeam = boxResp.data.teams.home.team.abbreviation || '';
-                awayTeam = boxResp.data.teams.away.team.abbreviation || '';
-            } catch (e) {
-                this.log(`Could not get boxscore for teams: ${e.message}`);
-            }
-
-            // Figure out pitcher's team (if batter is on home team, pitcher is away, and vice versa)
-            const playerTeamAbbr = this.players[playerId]?.team || '';
-            const pitcherTeam = (playerTeamAbbr === homeTeam) ? awayTeam : homeTeam;
-
-            // Count season HR total from game log
-            const allSplits = logResp.data.stats[0].splits;
-            const seasonHRTotal = allSplits.reduce((sum, g) => sum + (g.stat.homeRuns || 0), 0);
-
+    normalizeParkAnalysisRecord(value) {
+        if (Number.isFinite(Number(value)) && (typeof value === 'number' || typeof value === 'string')) {
+            const cleared = Number(value);
+            if (cleared < 0 || cleared > 30) return null;
             return {
-                launch_speed: hitData.launchSpeed,
-                launch_angle: hitData.launchAngle,
-                hit_distance_sc: hitData.totalDistance,
-                hc_x: hitData.coordinates.coordX,
-                hc_y: hitData.coordinates.coordY,
-                plate_z: plateZ,
-                home_team: homeTeam,
-                pitcher_name: pitcherName,
-                pitcher_team: pitcherTeam,
-                game_date: gameDate,
-                rbi: rbi,
-                rbi_description: this.getRbiDescription(rbi),
-                season_hr_total: seasonHRTotal
+                parksCleared: cleared,
+                parksEvaluated: 30,
+                parksExpected: 30,
+                analysisStatus: 'legacy',
+                legacy: true
             };
-        } catch (error) {
-            this.log(`Error fetching play-by-play Statcast for season ${season}: ${error.message}`);
+        }
+        if (!value || typeof value !== 'object') return null;
+        const parksCleared = Number(value.parksCleared ?? value.total_dongs);
+        const parksEvaluated = Number(value.parksEvaluated ?? value.parks_evaluated);
+        if (!Number.isFinite(parksCleared) || !Number.isFinite(parksEvaluated) ||
+            parksEvaluated <= 0 || parksCleared < 0 || parksCleared > parksEvaluated) {
             return null;
         }
+        return { ...value, parksCleared, parksEvaluated };
     }
 
-    async testEnhancedStatcast(message) {
-        try {
-            // Parse optional player name from command: !teststatcast [player]
-            const args = message.content.slice('!teststatcast'.length).trim().toLowerCase();
-            let playerId, playerData;
-
-            if (args) {
-                playerId = Object.keys(this.players).find(id =>
-                    this.players[id].name.toLowerCase().includes(args)
-                );
-                if (!playerId) {
-                    await message.reply(`Player "${args}" not found! Try: judge, rice, soto, ohtani, etc.`);
-                    return;
-                }
-                playerData = this.players[playerId];
-            } else {
-                // Pick a random tracked player
-                const ids = Object.keys(this.players);
-                playerId = ids[Math.floor(Math.random() * ids.length)];
-                playerData = this.players[playerId];
-            }
-
-            await message.reply(`Fetching real Statcast data for ${playerData.name}...`);
-
-            // Try current season first, then fall back to recent seasons
-            let statcastData = null;
-            let usedSeason = null;
-            for (const season of [this.currentSeason, this.currentSeason - 1, this.currentSeason - 2]) {
-                statcastData = await this.getStatcastFromPlayByPlay(playerId, season);
-                if (statcastData) {
-                    usedSeason = season;
-                    break;
-                }
-            }
-
-            if (!statcastData) {
-                await message.reply(`No Statcast HR data found for ${playerData.name} in recent seasons.`);
-                return;
-            }
-
-            const pitcherDisplay = statcastData.pitcher_team
-                ? `${statcastData.pitcher_name} (${statcastData.pitcher_team})`
-                : statcastData.pitcher_name;
-
-            await message.reply(
-                `Found HR from ${statcastData.game_date} (${usedSeason} season):\n` +
-                `EV: ${statcastData.launch_speed} mph | LA: ${statcastData.launch_angle}\u00b0 | ` +
-                `Dist: ${statcastData.hit_distance_sc} ft | Off: ${pitcherDisplay}\n` +
-                `Running physics analysis...`
-            );
-
-            const combinedAnalysisResult = await this.runHRAnalysis(statcastData, playerData.name, playerId);
-            if (!combinedAnalysisResult || !combinedAnalysisResult.success) {
-                await message.reply('HR analysis failed! Check console for errors.');
-                return;
-            }
-
-            const combinedFooterText = `TEST - Real data from ${statcastData.game_date}`;
-            const combinedMessageOptions = this.buildAlertMessageOptions(
-                playerId,
-                playerData,
-                statcastData.season_hr_total,
-                {
-                    rbiDescription: statcastData.rbi_description || 'Solo HR',
-                    rbi: statcastData.rbi,
-                    distance: `${Math.round(statcastData.hit_distance_sc)} ft`
-                },
-                {
-                    statcastData,
-                    analysisResult: combinedAnalysisResult,
-                    footerText: combinedFooterText
-                }
-            );
-
-            await message.channel.send(combinedMessageOptions);
-            this.cleanupAnalysisImage(combinedAnalysisResult.image_path);
-            await message.reply(`Test complete! ${combinedAnalysisResult.total_dongs}/30 parks cleared.`);
-            return;
-
-            // Step 1: Send a simulated basic HR alert (Message 1)
-            const hrType = statcastData.rbi_description || 'Solo HR';
-            const isNuke = statcastData.hit_distance_sc > 440;
-            const titleText = hrType === 'Grand Slam!' ?
-                `${playerData.name.toUpperCase()} GRAND SLAM!` :
-                `${playerData.name.toUpperCase()} ${hrType.toUpperCase().replace(' HR', ' HOME RUN')}!`;
-            const description = isNuke
-                ? `${playerData.name} just hit a fucking NUKE!`
-                : `${playerData.name} just hit a home run!`;
-
-            const basicEmbed = new Discord.EmbedBuilder()
-                .setTitle(titleText)
-                .setDescription(description)
-                .addFields(this.buildInitialAlertFields(
-                    playerData,
-                    statcastData.season_hr_total,
-                    hrType,
-                    `${Math.round(statcastData.hit_distance_sc)} ft`
-                ))
-                .setColor('#132448')
-                .setTimestamp()
-                .setFooter({ text: `TEST - Real data from ${statcastData.game_date}` });
-
-            const headshotUrl = this.getPlayerHeadshotUrl(playerData.name);
-            if (headshotUrl) {
-                basicEmbed.setThumbnail(headshotUrl);
-            }
-
-            await message.channel.send({ embeds: [basicEmbed] });
-
-            // Step 2: Run the full analysis pipeline (Message 2)
-            const analysisResult = await this.runHRAnalysis(statcastData, playerData.name, playerId);
-            if (!analysisResult || !analysisResult.success) {
-                await message.reply('HR analysis failed! Check console for errors.');
-                return;
-            }
-
-            const totalDongs = analysisResult.total_dongs;
-            let embedColor;
-            if (totalDongs >= 25) embedColor = '#FF2222';
-            else if (totalDongs >= 15) embedColor = '#FFD700';
-            else embedColor = '#888888';
-
-            // Get wall height at home park from analysis results
-            const homeParkDetail = analysisResult.park_details.find(p => p.team === statcastData.home_team);
-            const wallHeight = homeParkDetail ? `${homeParkDetail.fence_height} ft` : 'N/A';
-            const wallDist = homeParkDetail ? `${Math.round(homeParkDetail.wall_distance)} ft` : 'N/A';
-
-            const embed = new Discord.EmbedBuilder()
-                .setTitle(`Statcast Details: ${playerData.name} HR #${statcastData.season_hr_total}`)
-                .addFields(this.buildCompactStatcastFields(
-                    statcastData,
-                    analysisResult,
-                    wallHeight,
-                    wallDist,
-                    totalDongs,
-                    pitcherDisplay
-                ))
-                .setColor(embedColor)
-                .setTimestamp()
-                .setFooter({ text: `TEST - Real data from ${statcastData.game_date}` });
-
-            if (analysisResult.parks_not_cleared.length > 0 && analysisResult.parks_not_cleared.length <= 10) {
-                embed.addFields({
-                    name: `Not a HR in (${analysisResult.parks_not_cleared.length})`,
-                    value: analysisResult.parks_not_cleared.join(', '),
-                    inline: true
-                });
-            }
-
-            const messageOptions = { embeds: [embed] };
-
-            if (analysisResult.image_path && fs.existsSync(analysisResult.image_path)) {
-                const attachment = new Discord.AttachmentBuilder(analysisResult.image_path, { name: 'ballpark_overlay.png' });
-                embed.setImage('attachment://ballpark_overlay.png');
-                messageOptions.files = [attachment];
-            }
-
-            await message.channel.send(messageOptions);
-
-            // Cleanup
-            if (analysisResult.image_path && fs.existsSync(analysisResult.image_path)) {
-                fs.unlinkSync(analysisResult.image_path);
-            }
-
-            await message.reply(`Test complete! ${totalDongs}/30 parks cleared.`);
-        } catch (error) {
-            this.log(`Error in teststatcast: ${error.message}`);
-            await message.reply(`Error testing enhanced Statcast: ${error.message}`);
+    isCurrentParkAnalysisRecord(value) {
+        if (!this.analysisAvailable ||
+            this.analysisPermanentlyUnavailable ||
+            !this.ballparkDataVersion ||
+            !this.ballparkMetadataVersion) {
+            return false;
         }
-    }
-
-    getParksBreakdown(homeRunParks) {
-        const counts = { noDoubter: 0, tier24: 0, tier18: 0, tier12: 0, tier6: 0 };
-        const values = Object.values(homeRunParks || {})
-            .map(value => Number(value))
-            .filter(value => Number.isFinite(value));
-
-        for (const parksCleared of values) {
-            if (parksCleared === 30) {
-                counts.noDoubter++;
-            } else if (parksCleared >= 24) {
-                counts.tier24++;
-            } else if (parksCleared >= 18) {
-                counts.tier18++;
-            } else if (parksCleared >= 12) {
-                counts.tier12++;
-            } else {
-                counts.tier6++;
-            }
+        const record = this.normalizeParkAnalysisRecord(value);
+        if (!record || record.legacy) return false;
+        if (record.sourceDataHash !== this.ballparkDataVersion ||
+            record.ballparkDataVersion !== this.ballparkMetadataVersion) {
+            return false;
         }
-
-        return { total: values.length, counts };
+        return ['ok', 'partial'].includes(record.analysisStatus);
     }
 
     getSeasonHomeRunTotal(stats) {
-        return Math.max(0, parseInt(stats?.homeRuns, 10) || 0);
+        if (stats?.homeRuns === null || stats?.homeRuns === undefined) return null;
+        const total = Number.parseInt(stats.homeRuns, 10);
+        return Number.isInteger(total) && total >= 0 ? total : null;
     }
 
     buildParksBreakdownLines(breakdown, seasonHomeRunTotal = null) {
@@ -2496,18 +6039,18 @@ class BaseballBot {
             return [
                 summaryLine,
                 hasSeasonTotal && seasonHomeRunTotal > 0
-                    ? 'No park breakdown stored yet for those home runs.'
-                    : 'No parks data yet.'
+                    ? 'No current verified park breakdown is stored for those home runs.'
+                    : 'No current verified parks data is available.'
             ];
         }
 
         return [
             summaryLine,
-            `30/30 No Doubters: **${counts.noDoubter}**`,
-            `24+/30 parks: **${counts.tier24}**`,
-            `18+/30 parks: **${counts.tier18}**`,
-            `12+/30 parks: **${counts.tier12}**`,
-            `6 or fewer: **${counts.tier6}**`
+            `Cleared every evaluated park: **${counts.noDoubter}**`,
+            `Cleared at least 80%: **${counts.tier80}**`,
+            `Cleared 60–79%: **${counts.tier60}**`,
+            `Cleared 40–59%: **${counts.tier40}**`,
+            `Cleared under 40%: **${counts.under40}**`
         ];
     }
 
@@ -2518,22 +6061,145 @@ class BaseballBot {
         ].join('\n');
     }
 
-    async ensurePlayerParkData(playerId, seasonHomeRunTotal = null) {
+    queuePlayerParkBackfill(playerId, seasonHomeRunTotal = null, { force = false } = {}) {
         const playerData = this.players[playerId];
-        if (!playerData) {
-            return { seasonHomeRunTotal: 0, analyzedHomeRunTotal: 0, updatedHomeRuns: 0 };
+        const analyzedHomeRunTotal = Object.entries(playerData?.homeRunParks || {})
+            .filter(([eventId, value]) => {
+                return playerData?.authoritativeSnapshotInitialized &&
+                    playerData.authoritativeHomeRunIds.has(eventId) &&
+                    this.isCurrentParkAnalysisRecord(value);
+            }).length;
+        const normalizedTotal = seasonHomeRunTotal !== null &&
+            seasonHomeRunTotal !== undefined &&
+            Number.isInteger(Number(seasonHomeRunTotal)) &&
+            Number(seasonHomeRunTotal) >= 0
+            ? Number(seasonHomeRunTotal)
+            : null;
+        const remaining = normalizedTotal === null
+            ? null
+            : Math.max(0, normalizedTotal - analyzedHomeRunTotal);
+        if (!playerData || normalizedTotal === null) {
+            return { state: 'unavailable', queued: false, inProgress: false, remaining };
+        }
+        if (this.inventoryReconciliationPlayerIds.has(String(playerId))) {
+            return {
+                state: 'inventory_reconciliation',
+                queued: false,
+                inProgress: false,
+                remaining
+            };
+        }
+        if (this.analysisPermanentlyUnavailable) {
+            return {
+                state: 'analysis_unavailable',
+                queued: false,
+                inProgress: false,
+                remaining
+            };
+        }
+        if (!this.analysisAvailable) {
+            return {
+                state: 'analysis_unavailable',
+                queued: false,
+                inProgress: false,
+                remaining
+            };
+        }
+        if (remaining === 0) {
+            return { state: 'complete', queued: false, inProgress: false, remaining: 0 };
+        }
+        if (this.backfillPromises.has(playerId)) {
+            return { state: 'in_progress', queued: false, inProgress: true, remaining };
+        }
+        const now = this.clock().getTime();
+        const lastStarted = this.backfillLastStartedAt.get(playerId) || 0;
+        if (!force && now - lastStarted < this.backfillCooldownMs) {
+            return {
+                state: 'cooldown',
+                queued: false,
+                inProgress: false,
+                remaining,
+                retryAfterMs: this.backfillCooldownMs - (now - lastStarted)
+            };
+        }
+        this.backfillLastStartedAt.set(playerId, now);
+        const jobSeason = this.currentSeason;
+        let job;
+        job = this.ensurePlayerParkDataCore(playerId, normalizedTotal, jobSeason)
+            .catch(error => {
+                this.logEvent('error', 'park_backfill_failed', {
+                    playerId,
+                    error: error.message
+                });
+                return null;
+            })
+            .finally(() => {
+                if (this.backfillPromises.get(playerId) === job) {
+                    this.backfillPromises.delete(playerId);
+                }
+                this.backgroundJobs.delete(job);
+            });
+        this.backfillPromises.set(playerId, job);
+        this.backgroundJobs.add(job);
+        return { state: 'queued', queued: true, inProgress: true, remaining };
+    }
+
+    formatParkBackfillStatus(status) {
+        if (!status) return null;
+        if (status.state === 'queued') {
+            return `Park-analysis backfill queued in the background; ${status.remaining} HR remaining.`;
+        }
+        if (status.state === 'in_progress') {
+            return `Park-analysis backfill is already in progress; ${status.remaining} HR remaining.`;
+        }
+        if (status.state === 'cooldown') {
+            const seconds = Math.max(1, Math.ceil(status.retryAfterMs / 1000));
+            return `Park-analysis backfill is cooling down for about ${seconds}s; ${status.remaining} HR remaining.`;
+        }
+        if (status.state === 'analysis_unavailable') {
+            return 'Verified park projections are disabled pending geometry calibration; ' +
+                `no backfill was queued (${status.remaining} HR without current analysis).`;
+        }
+        if (status.state === 'inventory_reconciliation') {
+            return 'Park-analysis backfill was not queued while MLB event identities are being reconciled.';
+        }
+        if (status.state === 'unavailable') {
+            return 'Park-analysis backfill was not queued because the live season total is unavailable.';
+        }
+        return null;
+    }
+
+    async ensurePlayerParkDataCore(
+        playerId,
+        seasonHomeRunTotal = null,
+        jobSeason = this.currentSeason
+    ) {
+        const playerData = this.players[playerId];
+        const reconciliationPlayerId = String(playerId);
+        if (!playerData ||
+            jobSeason !== this.currentSeason ||
+            this.inventoryReconciliationPlayerIds.has(reconciliationPlayerId)) {
+            return { seasonHomeRunTotal: null, analyzedHomeRunTotal: 0, updatedHomeRuns: 0 };
         }
 
         if (!playerData.homeRunParks || typeof playerData.homeRunParks !== 'object') {
             playerData.homeRunParks = {};
         }
 
-        const targetHomeRuns = Number.isFinite(Number(seasonHomeRunTotal))
-            ? Math.max(0, parseInt(seasonHomeRunTotal, 10) || 0)
+        const suppliedTotal = seasonHomeRunTotal === null || seasonHomeRunTotal === undefined
+            ? null
+            : Number.parseInt(seasonHomeRunTotal, 10);
+        const targetHomeRuns = Number.isInteger(suppliedTotal) && suppliedTotal >= 0
+            ? suppliedTotal
             : await this.getPlayerHomeRuns(playerId);
-        const existingParkIds = Object.keys(playerData.homeRunParks);
+        const existingParkIds = Object.keys(playerData.homeRunParks)
+            .filter(id =>
+                playerData.authoritativeSnapshotInitialized &&
+                playerData.authoritativeHomeRunIds.has(id) &&
+                this.isCurrentParkAnalysisRecord(playerData.homeRunParks[id])
+            );
 
-        if (targetHomeRuns <= 0 || existingParkIds.length >= targetHomeRuns) {
+        if (targetHomeRuns === null || targetHomeRuns <= 0 || existingParkIds.length >= targetHomeRuns) {
             return {
                 seasonHomeRunTotal: targetHomeRuns,
                 analyzedHomeRunTotal: existingParkIds.length,
@@ -2543,67 +6209,133 @@ class BaseballBot {
 
         this.log(`${playerData.name}: backfilling park data (${existingParkIds.length}/${targetHomeRuns} HR analyzed)`);
 
-        const allHomeRunDetails = this.sortHomeRunDetailsChronologically(
-            await this.getRecentHomeRunDetails(playerId, targetHomeRuns)
+        const reconstructionTarget = Math.min(
+            targetHomeRuns,
+            existingParkIds.length + this.backfillBatchSize
         );
+        const allHomeRunDetails = this.sortHomeRunDetailsChronologically(
+            await this.getRecentHomeRunDetails(playerId, reconstructionTarget)
+        );
+        if (jobSeason !== this.currentSeason ||
+            this.inventoryReconciliationPlayerIds.has(reconciliationPlayerId)) {
+            return {
+                seasonHomeRunTotal: targetHomeRuns,
+                analyzedHomeRunTotal: existingParkIds.length,
+                updatedHomeRuns: 0,
+                aborted: 'season-rollover'
+            };
+        }
 
         let updatedHomeRuns = 0;
+        let attempted = 0;
         for (const hrDetail of allHomeRunDetails) {
+            if (jobSeason !== this.currentSeason ||
+                this.shuttingDown ||
+                this.inventoryReconciliationPlayerIds.has(reconciliationPlayerId)) {
+                break;
+            }
+            if (attempted >= this.backfillBatchSize) break;
             if (this.isFallbackHomeRunDetail(hrDetail) || !hrDetail?.gameId) {
                 continue;
             }
 
-            const hrId = this.buildHomeRunId(hrDetail);
-            if (Number.isFinite(Number(playerData.homeRunParks[hrId]))) {
+            const candidateHrId = this.buildHomeRunId(hrDetail, playerId);
+            if (!playerData.authoritativeSnapshotInitialized ||
+                !playerData.authoritativeHomeRunIds.has(candidateHrId)) {
                 continue;
             }
+            const hrId = this.reconcileHomeRunAliases(playerId, playerData, hrDetail);
+            if (this.isCurrentParkAnalysisRecord(playerData.homeRunParks[hrId])) {
+                continue;
+            }
+            attempted++;
 
+            let analysisResult = null;
+            const backfillAnalysisId = `${hrId}:backfill`;
             try {
                 const statcastData = await this.getStatcastDataForHR(playerId, hrDetail);
-                if (!statcastData) {
+                if (!statcastData ||
+                    this.inventoryReconciliationPlayerIds.has(reconciliationPlayerId)) {
                     continue;
                 }
 
-                const analysisResult = await this.runHRAnalysis(statcastData, playerData.name, playerId);
-                const parksCleared = Number(analysisResult?.total_dongs);
-                if (analysisResult?.success && Number.isFinite(parksCleared)) {
-                    playerData.homeRunParks[hrId] = parksCleared;
+                analysisResult = await this.runHRAnalysis(
+                    statcastData,
+                    playerData.name,
+                    playerId,
+                    backfillAnalysisId
+                );
+                if (jobSeason === this.currentSeason &&
+                    !this.inventoryReconciliationPlayerIds.has(reconciliationPlayerId) &&
+                    playerData.authoritativeHomeRunIds.has(hrId) &&
+                    this.isUsableAnalysisResult(analysisResult, statcastData)) {
+                    playerData.homeRunParks[hrId] =
+                        this.buildParkAnalysisRecord(analysisResult, statcastData);
                     updatedHomeRuns++;
-                }
-
-                if (analysisResult?.image_path) {
-                    this.cleanupAnalysisImage(analysisResult.image_path);
                 }
             } catch (error) {
                 this.log(`Could not backfill park data for ${playerData.name} HR ${hrId}: ${error.message}`);
+            } finally {
+                if (analysisResult?.temp_directory) {
+                    this.cleanupAnalysisArtifacts(analysisResult.temp_directory);
+                }
+                const cacheKey = [...this.analysisCache.keys()]
+                    .find(key => key.endsWith(`:${backfillAnalysisId}`));
+                if (cacheKey) this.analysisCache.delete(cacheKey);
             }
         }
 
+        if (jobSeason !== this.currentSeason) {
+            return {
+                seasonHomeRunTotal: targetHomeRuns,
+                analyzedHomeRunTotal: existingParkIds.length,
+                updatedHomeRuns: 0,
+                aborted: 'season-rollover'
+            };
+        }
         if (updatedHomeRuns > 0) {
-            this.saveState();
+            this.saveState({ throwOnError: true });
         }
 
-        const analyzedHomeRunTotal = Object.keys(playerData.homeRunParks).length;
+        const analyzedHomeRunTotal = Object.values(playerData.homeRunParks)
+            .filter(value => this.isCurrentParkAnalysisRecord(value)).length;
         this.log(`${playerData.name}: park data now available for ${analyzedHomeRunTotal}/${targetHomeRuns} HR`);
 
-        return { seasonHomeRunTotal: targetHomeRuns, analyzedHomeRunTotal, updatedHomeRuns };
+        return {
+            seasonHomeRunTotal: targetHomeRuns,
+            analyzedHomeRunTotal,
+            updatedHomeRuns,
+            remaining: Math.max(0, targetHomeRuns - analyzedHomeRunTotal)
+        };
     }
 
     async sendParksBreakdown(message, playerName = null) {
         try {
             if (playerName) {
-                const playerId = this.findPlayerIdByName(playerName);
+                const resolution = this.resolvePlayerByName(playerName);
+                const playerId = resolution.playerId;
                 if (!playerId) {
-                    await message.reply(`Could not find a tracked player matching "${playerName}".`);
+                    await message.reply(this.formatPlayerResolutionError(playerName, resolution));
                     return;
                 }
 
                 const playerData = this.players[playerId];
-                const stats = await this.getPlayerStats(playerId);
-                const seasonHomeRunTotal = this.getSeasonHomeRunTotal(stats);
-                await this.ensurePlayerParkData(playerId, seasonHomeRunTotal);
+                const snapshot = await this.getPlayerStatsForDisplay(playerId);
+                const seasonHomeRunTotal = this.getSeasonHomeRunTotal(snapshot.stats);
+                const backfillStatus = this.queuePlayerParkBackfill(playerId, seasonHomeRunTotal);
                 const breakdown = this.getParksBreakdown(playerData.homeRunParks || {});
-                const text = this.formatParksBreakdown(playerData.name, breakdown, seasonHomeRunTotal);
+                const notes = [];
+                if (snapshot.stale && snapshot.stats) {
+                    notes.push(
+                        `MLB is unavailable; the season total is cached (${this.formatSnapshotAge(snapshot.fetchedAt)}).`
+                    );
+                }
+                const backfillText = this.formatParkBackfillStatus(backfillStatus);
+                if (backfillText) notes.push(backfillText);
+                const text = [
+                    this.formatParksBreakdown(playerData.name, breakdown, seasonHomeRunTotal),
+                    ...notes
+                ].join('\n\n');
 
                 const embed = new Discord.EmbedBuilder()
                     .setTitle(`${playerData.name} — ${this.currentSeason} Parks Breakdown`)
@@ -2622,74 +6354,94 @@ class BaseballBot {
 
             // All players
             const sections = [];
-            for (const [playerId, playerData] of Object.entries(this.players)) {
-                const stats = await this.getPlayerStats(playerId);
-                const seasonHomeRunTotal = this.getSeasonHomeRunTotal(stats);
+            const playerEntries = Object.entries(this.players);
+            const snapshots = await Promise.all(
+                playerEntries.map(([playerId]) => this.getPlayerStatsForDisplay(playerId))
+            );
+            for (let index = 0; index < playerEntries.length; index++) {
+                const [, playerData] = playerEntries[index];
+                const snapshot = snapshots[index];
+                const seasonHomeRunTotal = this.getSeasonHomeRunTotal(snapshot.stats);
                 const breakdown = this.getParksBreakdown(playerData.homeRunParks || {});
-                sections.push(this.formatParksBreakdown(playerData.name, breakdown, seasonHomeRunTotal));
+                const availabilityNote = snapshot.stale && snapshot.stats
+                    ? `\nCached total (${this.formatSnapshotAge(snapshot.fetchedAt)}).`
+                    : (snapshot.stats ? '' : '\nLive total unavailable; no cached total.');
+                sections.push(
+                    `${this.formatParksBreakdown(playerData.name, breakdown, seasonHomeRunTotal)}${availabilityNote}`
+                );
             }
+            const analysisNote = this.analysisPermanentlyUnavailable
+                ? 'Verified park projections are disabled pending geometry calibration.'
+                : null;
 
             const embed = new Discord.EmbedBuilder()
                 .setTitle(`${this.currentSeason} Parks Breakdown — All Players`)
-                .setDescription(sections.join('\n\n'))
+                .setDescription(
+                    [analysisNote, ...sections].filter(Boolean).join('\n\n')
+                )
                 .setColor('#132448')
                 .setTimestamp()
-                .setFooter({ text: 'Counts show stored park analysis versus live season HR totals' });
+                .setFooter({
+                    text: 'Counts include only the current verified analysis version'
+                });
 
             await message.reply({ embeds: [embed] });
         } catch (error) {
-            console.error('Error in sendParksBreakdown:', error);
+            this.logEvent('error', 'parks_command_failed', { error: error.message });
             await message.reply('Had trouble pulling parks breakdown data.');
         }
     }
 
     async sendPlayerStats(playerId, message) {
         try {
-            const stats = await this.getPlayerStats(playerId);
             const playerData = this.players[playerId];
-            
+            const snapshot = await this.getPlayerStatsForDisplay(playerId);
+            const stats = snapshot.stats;
+
             if (!stats) {
-                await message.reply(`Sorry, I couldn't get stats for ${playerData.name} right now!`);
+                await message.reply(
+                    `MLB stats for ${playerData.name} are unavailable, and the bot has no cached season snapshot to show.`
+                );
                 return;
             }
 
             const seasonHomeRunTotal = this.getSeasonHomeRunTotal(stats);
-            await this.ensurePlayerParkData(playerId, seasonHomeRunTotal);
+            const backfillStatus = this.queuePlayerParkBackfill(playerId, seasonHomeRunTotal);
             const parksBreakdown = this.getParksBreakdown(playerData.homeRunParks || {});
-            const parksBreakdownText = this.buildParksBreakdownLines(parksBreakdown, seasonHomeRunTotal).join('\n');
+            const backfillText = this.formatParkBackfillStatus(backfillStatus);
+            const parksBreakdownText = [
+                ...this.buildParksBreakdownLines(parksBreakdown, seasonHomeRunTotal),
+                ...(backfillText ? [backfillText] : [])
+            ].join('\n');
 
             const embed = new Discord.EmbedBuilder()
                 .setTitle(`${playerData.name} ${this.currentSeason} Stats`)
                 .addFields(
-                    { name: '⚾ Hitting', value: `**AVG:** ${stats.avg || 'N/A'} | **HR:** ${stats.homeRuns || 0} | **RBI:** ${stats.rbi || 0} | **R:** ${stats.runs || 0}`, inline: false },
-                    { name: '📊 Advanced', value: `**OBP:** ${stats.obp || 'N/A'} | **SLG:** ${stats.slg || 'N/A'} | **OPS:** ${stats.ops || 'N/A'}`, inline: false },
-                    { name: '🏃 Other', value: `**H:** ${stats.hits || 0} | **AB:** ${stats.atBats || 0} | **SB:** ${stats.stolenBases || 0} | **SO:** ${stats.strikeOuts || 0} | **BB:** ${stats.baseOnBalls || 0}`, inline: false },
+                    { name: '⚾ Hitting', value: `**AVG:** ${this.formatStatValue(stats.avg)} | **HR:** ${this.formatStatValue(stats.homeRuns)} | **RBI:** ${this.formatStatValue(stats.rbi)} | **R:** ${this.formatStatValue(stats.runs)}`, inline: false },
+                    { name: '📊 Advanced', value: `**OBP:** ${this.formatStatValue(stats.obp)} | **SLG:** ${this.formatStatValue(stats.slg)} | **OPS:** ${this.formatStatValue(stats.ops)}`, inline: false },
+                    { name: '🏃 Other', value: `**H:** ${this.formatStatValue(stats.hits)} | **AB:** ${this.formatStatValue(stats.atBats)} | **SB:** ${this.formatStatValue(stats.stolenBases)} | **SO:** ${this.formatStatValue(stats.strikeOuts)} | **BB:** ${this.formatStatValue(stats.baseOnBalls)}`, inline: false },
                     { name: '🏟️ Parks Breakdown', value: parksBreakdownText, inline: false },
                     { name: '🤖 Bot Tracking', value: `**Last Checked:** ${this.players[playerId].lastCheckedHR} HR`, inline: false }
                 )
                 .setColor('#132448')
                 .setTimestamp()
-                .setFooter({ text: `Team: ${playerData.team} | #${playerData.number}` });
+                .setFooter({
+                    text: snapshot.stale
+                        ? `Cached MLB snapshot (${this.formatSnapshotAge(snapshot.fetchedAt)}) | Team: ${playerData.team} | #${playerData.number}`
+                        : `Live MLB data | Team: ${playerData.team} | #${playerData.number}`
+                });
 
-            // Add player headshot
-            const headshots = {
-                'Aaron Judge': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/592450/headshot/67/current',
-                'Ben Rice': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/700250/headshot/67/current',
-                'Juan Soto': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/665742/headshot/67/current',
-                'Shohei Ohtani': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660271/headshot/67/current',
-                'Kyle Schwarber': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/656941/headshot/67/current',
-                'Bryce Harper': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/547180/headshot/67/current',
-                'Gunnar Henderson': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/683002/headshot/67/current'
-            };
-            
-            const statsThumbnail = this.getPlayerHeadshotUrlById(playerId) || headshots[playerData.name];
+            const statsThumbnail = this.getPlayerHeadshotUrlById(playerId);
             if (statsThumbnail) {
                 embed.setThumbnail(statsThumbnail);
             }
-            
+
             await message.reply({ embeds: [embed] });
         } catch (error) {
-            console.error('Error in sendPlayerStats:', error);
+            this.logEvent('error', 'player_stats_command_failed', {
+                playerId,
+                error: error.message
+            });
             await message.reply('Sorry, I had trouble getting the stats right now!');
         }
     }
@@ -2698,12 +6450,13 @@ class BaseballBot {
         const playerList = Object.values(this.players)
             .map(player => `• ${player.name} (${player.team} #${player.number})`)
             .join('\n');
+        const shortcutCommands = [...this.getPlayerShortcutCommands().keys()].sort().join(', ');
 
         const embed = new Discord.EmbedBuilder()
             .setTitle('📊 Tracked Players')
             .setDescription(`Currently monitoring these players for home runs:\n\n${playerList}`)
             .addFields(
-                { name: 'Player Commands', value: '!judge, !rice, !soto, !ohtani, !schwarber, !harper, !gunnar, !trout', inline: false },
+                { name: 'Player Commands', value: shortcutCommands || 'No unique shortcut commands configured', inline: false },
                 { name: 'General Commands', value: '!hrstats, !parkstats, !players', inline: false },
                 { name: 'Admin Commands', value: '!forcecheck, !testhr, !reset [player], !debug', inline: false },
                 { name: 'Alert Channels', value: `Sending to ${this.channelIds.length} channel(s)`, inline: false }
@@ -2716,23 +6469,34 @@ class BaseballBot {
 
     async sendAllHomeRunStats(message) {
         try {
-            const hrStats = [];
-            
-            for (const [playerId, playerData] of Object.entries(this.players)) {
-                const homeRuns = await this.getPlayerHomeRuns(playerId);
-                hrStats.push({
-                    name: playerData.name,
-                    team: playerData.team,
-                    homeRuns: homeRuns,
-                    tracked: playerData.lastCheckedHR
-                });
-            }
-            
-            // Sort by home runs (descending)
-            hrStats.sort((a, b) => b.homeRuns - a.homeRuns);
-            
+            const hrStats = await Promise.all(
+                Object.entries(this.players).map(async ([playerId, playerData]) => {
+                    const snapshot = await this.getPlayerStatsForDisplay(playerId);
+                    return {
+                        name: playerData.name,
+                        team: playerData.team,
+                        homeRuns: this.getSeasonHomeRunTotal(snapshot.stats),
+                        tracked: playerData.lastCheckedHR,
+                        stale: snapshot.stale && Boolean(snapshot.stats),
+                        fetchedAt: snapshot.fetchedAt
+                    };
+                })
+            );
+
+            hrStats.sort((a, b) => {
+                if (a.homeRuns === null && b.homeRuns !== null) return 1;
+                if (a.homeRuns !== null && b.homeRuns === null) return -1;
+                if (a.homeRuns !== b.homeRuns) return (b.homeRuns || 0) - (a.homeRuns || 0);
+                return a.name.localeCompare(b.name);
+            });
+
             const statsText = hrStats
-                .map((player, index) => `${index + 1}. ${player.name} (${player.team}): ${player.homeRuns} HR (tracking: ${player.tracked})`)
+                .map((player, index) => {
+                    const total = player.homeRuns === null
+                        ? 'Unavailable'
+                        : `${player.homeRuns} HR${player.stale ? ` (cached, ${this.formatSnapshotAge(player.fetchedAt)})` : ''}`;
+                    return `${index + 1}. ${player.name} (${player.team}): ${total} (tracking: ${player.tracked})`;
+                })
                 .join('\n');
 
             const embed = new Discord.EmbedBuilder()
@@ -2744,7 +6508,7 @@ class BaseballBot {
 
             await message.reply({ embeds: [embed] });
         } catch (error) {
-            console.error('Error in sendAllHomeRunStats:', error);
+            this.logEvent('error', 'leaderboard_command_failed', { error: error.message });
             await message.reply('Sorry, I had trouble getting the home run stats!');
         }
     }
@@ -2753,30 +6517,30 @@ class BaseballBot {
         try {
             // Pick a random player for the test
             const playerIds = Object.keys(this.players);
-            const randomPlayerId = playerIds[Math.floor(Math.random() * playerIds.length)];
+            const randomPlayerId = playerIds[Math.floor(this.random() * playerIds.length)];
             const playerData = this.players[randomPlayerId];
-            
+
             // Create sample home run data
             const sampleDistances = ['415 ft', '438 ft', '462 ft', '395 ft', '441 ft', '478 ft'];
             const sampleRBIs = [1, 2, 3, 4];
             const sampleHRTypes = ['Solo HR', '2-run HR', '3-run HR', 'Grand Slam!'];
-            
-            const randomDistance = sampleDistances[Math.floor(Math.random() * sampleDistances.length)];
-            const randomRBI = sampleRBIs[Math.floor(Math.random() * sampleRBIs.length)];
+
+            const randomDistance = sampleDistances[Math.floor(this.random() * sampleDistances.length)];
+            const randomRBI = sampleRBIs[Math.floor(this.random() * sampleRBIs.length)];
             const randomHRType = sampleHRTypes[randomRBI - 1];
-            
+
             const testDetails = {
                 distance: randomDistance,
                 rbi: randomRBI,
                 rbiDescription: randomHRType
             };
-            
+
             // Create the embed for test (only send to current channel)
             const hrType = testDetails.rbiDescription || 'Solo HR';
-            const titleText = hrType === 'Grand Slam!' ? 
+            const titleText = hrType === 'Grand Slam!' ?
                 `${playerData.name.toUpperCase()} GRAND SLAM!` :
                 `${playerData.name.toUpperCase()} ${hrType.toUpperCase().replace(' HR', ' HOME RUN')}!`;
-            
+
             // Parse distance for nuke check
             let isNuke = false;
             if (randomDistance) {
@@ -2786,90 +6550,286 @@ class BaseballBot {
                     isNuke = distanceNum > 440;
                 }
             }
-            
+
             // Always use singular description
             let description = `${playerData.name} just hit a home run!`;
             if (isNuke) {
-                description = `${playerData.name} just hit a fucking NUKE!`;
+                description = `${playerData.name} just launched a massive home run!`;
             }
-            
+
             const embed = new Discord.EmbedBuilder()
                 .setTitle(titleText)
                 .setDescription(description)
                 .addFields(this.buildInitialAlertFields(
                     playerData,
-                    `${Math.floor(Math.random() * 40) + 10}`,
+                    `${Math.floor(this.random() * 40) + 10}`,
                     hrType,
                     testDetails.distance
                 ))
                 .setColor('#132448')
                 .setTimestamp();
 
-            // Set footer if details pending
-            if (testDetails.rbi === 'unknown') {
-                embed.setFooter({ text: 'Details may update soon—check back!' });
-            }
-
-            // Set player headshot using MLB's official headshot URLs
-            const headshots = {
-                'Aaron Judge': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/592450/headshot/67/current',
-                'Ben Rice': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/700250/headshot/67/current',
-                'Juan Soto': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/665742/headshot/67/current',
-                'Shohei Ohtani': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/660271/headshot/67/current',
-                'Kyle Schwarber': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/656941/headshot/67/current',
-                'Bryce Harper': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/547180/headshot/67/current',
-                'Gunnar Henderson': 'https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/683002/headshot/67/current'
-            };
-            
-            const testThumbnail = this.getPlayerHeadshotUrlById(randomPlayerId) || headshots[playerData.name];
+            const testThumbnail = this.getPlayerHeadshotUrlById(randomPlayerId);
             if (testThumbnail) {
                 embed.setThumbnail(testThumbnail);
             }
 
             // Send only to the current channel where the command was issued
             await message.channel.send({ embeds: [embed] });
-            
+
             await message.reply(`🧪 Test alert sent to this channel for ${playerData.name}!`);
         } catch (error) {
             this.log(`Error sending test message: ${error.message}`);
             await message.reply('Sorry, I had trouble sending the test alert!');
         }
     }
+
+    scheduleFatalShutdown(reason, error = null) {
+        if (this.fatalShutdownPromise) return this.fatalShutdownPromise;
+        this.processRef.exitCode = 1;
+        this.logEvent('fatal', 'fatal_shutdown_scheduled', {
+            reason,
+            error: error?.message || null
+        });
+        this.fatalShutdownPromise = Promise.resolve()
+            .then(() => this.shutdown(reason))
+            .catch(shutdownError => {
+                this.logEvent('fatal', 'fatal_shutdown_failed', {
+                    reason,
+                    error: shutdownError.message
+                });
+            });
+        return this.fatalShutdownPromise;
+    }
+
+    destroyDiscordClient() {
+        if (this.discordDestroyed) return;
+        this.discordDestroyed = true;
+        try {
+            this.client.destroy();
+        } catch (error) {
+            this.logEvent('warn', 'discord_destroy_failed', {
+                error: error.message
+            });
+        }
+    }
+
+    finalizeShutdown(reason, timedOut) {
+        if (this.shutdownFinalizePromise) {
+            return this.shutdownFinalizePromise;
+        }
+        this.shutdownFinalizePromise = (async () => {
+            try {
+                this.saveState({ throwOnError: true });
+            } catch (error) {
+                this.processRef.exitCode = 1;
+                this.logEvent('error', 'shutdown_state_save_failed', {
+                    error: error.message
+                });
+            }
+
+            for (const directory of [...this.activeTempDirectories]) {
+                this.cleanupAnalysisArtifacts(directory);
+            }
+            this.destroyDiscordClient();
+            this.releaseStateLease();
+            if (this.removeProcessHandlers) {
+                this.removeProcessHandlers();
+                this.removeProcessHandlers = null;
+            }
+            this.logEvent('info', 'shutdown_completed', { reason, timedOut });
+        })();
+        return this.shutdownFinalizePromise;
+    }
+
+    async shutdown(reason = 'shutdown') {
+        if (this.shutdownPromise) return this.shutdownPromise;
+        this.shuttingDown = true;
+        this.shutdownPromise = (async () => {
+            this.logEvent('info', 'shutdown_started', { reason });
+            if (this.monitorTask) {
+                clearTimeout(this.monitorTask);
+                this.monitorTask = null;
+            }
+            if (this.enrichmentWakeTimer) {
+                clearTimeout(this.enrichmentWakeTimer);
+                this.enrichmentWakeTimer = null;
+            }
+
+            for (const release of this.analysisQueue.splice(0)) {
+                release();
+            }
+            this.enrichmentQueue.length = 0;
+            this.destroyDiscordClient();
+
+            const activeWork = () => [...new Set([
+                ...(this.checkInProgress ? [this.checkInProgress] : []),
+                ...this.backgroundJobs
+            ])];
+            const deadline = Date.now() + this.shutdownTimeoutMs;
+            let timedOut = false;
+            while (activeWork().length > 0 && Date.now() < deadline) {
+                const remainingMs = Math.max(1, deadline - Date.now());
+                let timeoutHandle;
+                const outcome = await Promise.race([
+                    Promise.allSettled(activeWork()).then(() => 'settled'),
+                    new Promise(resolve => {
+                        timeoutHandle = setTimeout(() => resolve('timeout'), remainingMs);
+                    })
+                ]);
+                if (timeoutHandle) clearTimeout(timeoutHandle);
+                if (outcome === 'timeout') {
+                    timedOut = true;
+                    break;
+                }
+            }
+            if (timedOut) {
+                this.processRef.exitCode = 1;
+                const remainingWork = activeWork();
+                this.logEvent('warn', 'shutdown_work_timeout', {
+                    activeJobs: remainingWork.length,
+                    timeoutMs: this.shutdownTimeoutMs
+                });
+                void (async () => {
+                    while (activeWork().length > 0) {
+                        await Promise.allSettled(activeWork());
+                    }
+                    await this.finalizeShutdown(reason, true);
+                })()
+                    .catch(error => {
+                        this.logEvent('fatal', 'deferred_shutdown_finalize_failed', {
+                            reason,
+                            error: error.message
+                        });
+                    });
+                return;
+            }
+            await this.finalizeShutdown(reason, false);
+        })();
+        return this.shutdownPromise;
+    }
 }
 
-// Usage - Parse multiple channel IDs from environment
-const botToken = process.env.BOT_TOKEN;
-const channelIdString = process.env.CHANNEL_ID;
-const adminUserIds = (process.env.ADMIN_USER_IDS || '')
-    .split(',')
-    .map(id => id.trim())
-    .filter(id => id.length > 0);
-const botUsername = process.env.BOT_USERNAME || 'home-run-bot';
-
-if (!botToken || !channelIdString) {
-    console.error('Missing required environment variables: BOT_TOKEN and/or CHANNEL_ID');
-    process.exit(1);
+function buildBot(config, options = {}) {
+    if (!config || typeof config !== 'object') {
+        throw new Error('A parsed bot configuration is required');
+    }
+    return new BaseballBot(config.token, config.channelIds, {
+        ...config,
+        ...options
+    });
 }
 
-// Parse comma-separated channel IDs
-const channelIds = channelIdString.split(',').map(id => id.trim()).filter(id => id.length > 0);
+function installProcessHandlers(bot, processRef = process) {
+    const signalHandlers = new Map(
+        ['SIGTERM', 'SIGINT'].map(signal => [
+            signal,
+            () => {
+                void bot.shutdown(signal).catch(error => {
+                    processRef.exitCode = 1;
+                    bot.logEvent('fatal', 'signal_shutdown_failed', { signal, error: error.message });
+                });
+            }
+        ])
+    );
+    const handleUnhandledRejection = reason => {
+        const error = reason instanceof Error ? reason : new Error(String(reason));
+        bot.logEvent('fatal', 'unhandled_rejection', { error: error.message });
+        bot.scheduleFatalShutdown('unhandled-rejection', error);
+    };
+    const handleUncaughtException = error => {
+        bot.logEvent('fatal', 'uncaught_exception', { error: error?.message || String(error) });
+        bot.scheduleFatalShutdown('uncaught-exception', error);
+    };
 
-if (channelIds.length === 0) {
-    console.error('No valid channel IDs found in CHANNEL_ID environment variable');
-    process.exit(1);
+    for (const [signal, handler] of signalHandlers) {
+        processRef.on(signal, handler);
+    }
+    processRef.on('unhandledRejection', handleUnhandledRejection);
+    processRef.on('uncaughtException', handleUncaughtException);
+    return () => {
+        for (const [signal, handler] of signalHandlers) {
+            processRef.removeListener(signal, handler);
+        }
+        processRef.removeListener('unhandledRejection', handleUnhandledRejection);
+        processRef.removeListener('uncaughtException', handleUncaughtException);
+    };
 }
 
-console.log(`Starting bot with ${channelIds.length} channel(s): ${channelIds.join(', ')}`);
+async function start(config = parseConfig(), options = {}) {
+    const bot = buildBot(config, options);
+    bot.removeProcessHandlers = installProcessHandlers(bot, options.processRef || process);
+    let readyTimeout;
+    try {
+        const initializePromise = bot.initialize();
+        const gatewayStartup = initializePromise.then(
+            () => bot.gatewayReadyPromise
+        );
+        const timeout = new Promise((resolve, reject) => {
+            readyTimeout = setTimeout(() => {
+                reject(new Error(
+                    `Discord gateway did not become ready within ${bot.readyTimeoutMs}ms`
+                ));
+            }, bot.readyTimeoutMs);
+        });
+        await Promise.race([gatewayStartup, timeout]);
+        if (readyTimeout) {
+            clearTimeout(readyTimeout);
+            readyTimeout = null;
+        }
+        await initializePromise;
+        await bot.readyPromise;
+        return bot;
+    } catch (error) {
+        bot.processRef.exitCode = 1;
+        bot.logEvent('fatal', 'startup_failed', { error: error.message });
+        await bot.shutdown('startup-failed');
+        throw error;
+    } finally {
+        if (readyTimeout) clearTimeout(readyTimeout);
+    }
+}
 
-const bot = new BaseballBot(botToken, channelIds, {
-    adminUserIds,
-    botUsername
-});
+function loadRuntimeEnvironment({
+    environment = process.env,
+    environmentPath = path.join(__dirname, '.env'),
+    fileSystem = fs,
+} = {}) {
+    const requiredConfigurationIsInjected =
+        String(environment.BOT_TOKEN || '').trim() !== '' &&
+        String(environment.CHANNEL_ID || '').trim() !== '';
+    return loadEnvironmentFile(environmentPath, environment, {
+        fileSystem,
+        ignoreAccessErrors: requiredConfigurationIsInjected,
+    });
+}
 
-process.on('SIGTERM', () => {
-    console.log('Received SIGTERM, shutting down gracefully');
-    bot.client.destroy();
-    process.exit(0);
-});
+async function runMain() {
+    loadRuntimeEnvironment();
+    return start();
+}
 
-bot.initialize().catch(console.error);
+module.exports = {
+    BaseballBot,
+    STATE_VERSION,
+    buildBot,
+    installProcessHandlers,
+    loadRuntimeEnvironment,
+    parseConfig,
+    parseCsvIds,
+    resolveStatePath,
+    start,
+    validateStateDocument
+};
+
+if (require.main === module) {
+    runMain().catch(error => {
+        console.error(JSON.stringify({
+            timestamp: new Date().toISOString(),
+            level: 'fatal',
+            event: 'startup_failed',
+            error: error.message
+        }));
+        process.exitCode = 1;
+    });
+}

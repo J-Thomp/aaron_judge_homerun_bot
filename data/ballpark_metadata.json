@@ -1,0 +1,198 @@
+{
+  "schema_version": 2,
+  "data_version": "2026-07-28.fence-data-removed-v1",
+  "venue_mapping_verified_at": "2026-07-28",
+  "geometry_reviewed_at": "2026-07-28",
+  "advanced_analysis_enabled": false,
+  "analysis_disabled_reason": "Advanced park projections are disabled because no redistributable, calibrated fence profiles are checked in; the retained MIT-licensed drawing snapshot has an unrecorded revision and has not been calibrated. Basic and Statcast home-run alerts remain available.",
+  "analysis_release": {
+    "status": "disabled",
+    "verification_schema_version": 1,
+    "source_revisions_recorded": false,
+    "calibration_complete": false,
+    "calculation_rendering_walls_aligned": false,
+    "verified_venue_ids": []
+  },
+  "venue_mapping_source": "https://statsapi.mlb.com/api/v1/teams?sportId=1&season=2026&hydrate=venue",
+  "geometry_sources": [
+    {
+      "name": "GeomMLBStadiums stadium paths",
+      "url": "https://github.com/bdilday/GeomMLBStadiums",
+      "license": "MIT",
+      "copyright": "Copyright (c) 2018 Ben Dilday",
+      "revision": "unrecorded checked-in snapshot"
+    }
+  ],
+  "geometry_source_revision": "unrecorded-stadium-path-snapshot;fence-profiles-removed",
+  "geometry_source_provenance_note": "The exact upstream GeomMLBStadiums revision used for stadium_paths.json was not recorded. Its MIT attribution is preserved in THIRD_PARTY_NOTICES.md. The prior fence-height snapshot was removed because no upstream license grant was identified. No retained geometry is enabled for production analysis.",
+  "geometry_files_sha256": {
+    "fences.json": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+    "stadium_paths.json": "aed23b91ca17ad849997590d738485fe67918e110bd006c5287862c5232707a3"
+  },
+  "expected_active_venues": 30,
+  "team_aliases": {
+    "ARI": "AZ",
+    "CHW": "CWS",
+    "KCR": "KC",
+    "SDP": "SD",
+    "SFG": "SF",
+    "TBR": "TB",
+    "WAS": "WSH",
+    "WSN": "WSH"
+  },
+  "verified_venues": {},
+  "retained_venue_mappings": {},
+  "unsupported_venues": {
+    "1": {
+      "team_code": "LAA",
+      "venue_name": "Angel Stadium",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "2": {
+      "team_code": "BAL",
+      "venue_name": "Oriole Park at Camden Yards",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "3": {
+      "team_code": "BOS",
+      "venue_name": "Fenway Park",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "4": {
+      "team_code": "CWS",
+      "venue_name": "Rate Field",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "5": {
+      "team_code": "CLE",
+      "venue_name": "Progressive Field",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "7": {
+      "team_code": "KC",
+      "venue_name": "Kauffman Stadium",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "12": {
+      "team_code": "TB",
+      "venue_name": "Tropicana Field",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "14": {
+      "team_code": "TOR",
+      "venue_name": "Rogers Centre",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "15": {
+      "team_code": "AZ",
+      "venue_name": "Chase Field",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "17": {
+      "team_code": "CHC",
+      "venue_name": "Wrigley Field",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "19": {
+      "team_code": "COL",
+      "venue_name": "Coors Field",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "22": {
+      "team_code": "LAD",
+      "venue_name": "UNIQLO Field at Dodger Stadium",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "31": {
+      "team_code": "PIT",
+      "venue_name": "PNC Park",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "32": {
+      "team_code": "MIL",
+      "venue_name": "American Family Field",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "680": {
+      "team_code": "SEA",
+      "venue_name": "T-Mobile Park",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "2392": {
+      "team_code": "HOU",
+      "venue_name": "Daikin Park",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "2394": {
+      "team_code": "DET",
+      "venue_name": "Comerica Park",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "2395": {
+      "team_code": "SF",
+      "venue_name": "Oracle Park",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "2602": {
+      "team_code": "CIN",
+      "venue_name": "Great American Ball Park",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "2680": {
+      "team_code": "SD",
+      "venue_name": "Petco Park",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "2681": {
+      "team_code": "PHI",
+      "venue_name": "Citizens Bank Park",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "2889": {
+      "team_code": "STL",
+      "venue_name": "Busch Stadium",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "3289": {
+      "team_code": "NYM",
+      "venue_name": "Citi Field",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "3309": {
+      "team_code": "WSH",
+      "venue_name": "Nationals Park",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "3312": {
+      "team_code": "MIN",
+      "venue_name": "Target Field",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "3313": {
+      "team_code": "NYY",
+      "venue_name": "Yankee Stadium",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "4169": {
+      "team_code": "MIA",
+      "venue_name": "loanDepot park",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "4705": {
+      "team_code": "ATL",
+      "venue_name": "Truist Park",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "5325": {
+      "team_code": "TEX",
+      "venue_name": "Globe Life Field",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    },
+    "2529": {
+      "team_code": "ATH",
+      "venue_name": "Sutter Health Park",
+      "reason": "No redistributable, calibrated fence profile is checked in."
+    }
+  },
+  "excluded_geometry_teams": []
+}

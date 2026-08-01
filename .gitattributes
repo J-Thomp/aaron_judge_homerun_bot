@@ -1,0 +1,6 @@
+* text=auto eol=lf
+
+data/fences.json text eol=lf
+data/stadium_paths.json text eol=lf
+data/ballpark_metadata.json text eol=lf
+scripts/hr_analysis.py text eol=lf

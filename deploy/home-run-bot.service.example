@@ -1,0 +1,37 @@
+[Unit]
+Description=Home Run Tracker Discord bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=home-run-bot
+Group=home-run-bot
+WorkingDirectory=/opt/home-run-bot
+EnvironmentFile=/opt/home-run-bot/.env
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/env STATE_PATH=/var/lib/home-run-bot/bot_state.json MPLCONFIGDIR=/var/cache/home-run-bot/matplotlib TMPDIR=/var/cache/home-run-bot PYTHONDONTWRITEBYTECODE=1 /usr/bin/node /opt/home-run-bot/bot.js
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=60
+KillSignal=SIGTERM
+UMask=0077
+StateDirectory=home-run-bot
+StateDirectoryMode=0700
+CacheDirectory=home-run-bot
+CacheDirectoryMode=0700
+
+# The application, static ballpark data, and virtual environment are read-only.
+# State/cache directories and the private temporary directory are writable.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+PrivateDevices=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

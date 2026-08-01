@@ -1,2 +1,5 @@
-matplotlib>=3.8
-numpy>=1.26
+# Reviewed exact versions for the project's Python 3.10-3.13 runtime.
+# Keep direct imports explicit instead of relying on transitive dependencies.
+matplotlib==3.10.8
+numpy==2.2.6
+Pillow==12.3.0

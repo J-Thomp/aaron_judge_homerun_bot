@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node:
+    name: Node checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts --no-audit
+
+      - name: Check production dependency advisories
+        run: npm audit --omit=dev
+
+      - name: Run syntax and unit checks
+        run: npm run check:node
+
+  python:
+    name: Python checks (${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    env:
+      MPLCONFIGDIR: ${{ runner.temp }}/matplotlib
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js for the cross-platform test launcher
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install pinned Python dependencies
+        run: >-
+          python -m pip install
+          --disable-pip-version-check
+          --requirement requirements.txt
+          pip-audit==2.10.1
+
+      - name: Verify dependency consistency
+        run: python -m pip check
+
+      - name: Check Python dependency advisories
+        run: >-
+          python -m pip_audit
+          --requirement requirements.txt
+          --progress-spinner=off
+
+      - name: Compile maintained Python entry points
+        run: >-
+          python -m py_compile
+          scripts/hr_analysis.py
+          scripts/refresh_ballpark_data.py
+          scripts/render_stadium_gallery.py
+          test/test_ballpark_tools.py
+          test/test_hr_analysis.py
+          test/test_hr_analysis_contract.py
+
+      - name: Run deterministic Python tests
+        run: npm run test:python
